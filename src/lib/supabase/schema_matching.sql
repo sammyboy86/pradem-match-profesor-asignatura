@@ -1,0 +1,18 @@
+-- ══════════════════════════════════════════════════════════════════════
+-- Script SQL de Soporte para '06matchProfesorAsignatura'
+-- ══════════════════════════════════════════════════════════════════════
+-- La tabla 'asignaturas_extraidas' almacena los embeddings en formato jsonb
+-- (array de floats de 768 dimensiones provisto por Jina AI).
+--
+-- Si deseas habilitar la extensión pgvector nativa en Supabase:
+-- 1. Habilitar extensión:
+--    CREATE EXTENSION IF NOT EXISTS vector;
+--
+-- 2. Añadir columna tipo vector opcional:
+--    ALTER TABLE public.asignaturas_extraidas ADD COLUMN IF NOT EXISTS embedding_vector vector(768);
+--
+-- 3. Crear índice HNSW para búsquedas vectoriales a ultra alta velocidad:
+--    CREATE INDEX IF NOT EXISTS idx_asignaturas_embedding_hnsw 
+--    ON public.asignaturas_extraidas 
+--    USING hnsw (embedding_vector vector_cosine_ops);
+-- ══════════════════════════════════════════════════════════════════════
