@@ -11,7 +11,7 @@ const nextConfig: NextConfig = {
   //   source: "/mi-herramienta/:path*"
   //   destination: `${TOOL_URL}/mi-herramienta/:path*`
   //
-  basePath: "/match-profesor-asignatura",
+  basePath: "/embed-asignatura",
 
   // Necesario para que las imágenes funcionen correctamente
   images: {

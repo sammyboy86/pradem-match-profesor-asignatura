@@ -6,13 +6,11 @@ import Step1ConnectionStatus from "@/components/Step1ConnectionStatus";
 import Step2EmbeddingConfig from "@/components/Step2EmbeddingConfig";
 import Step3GenerateAction from "@/components/Step3GenerateAction";
 import Step4RecordsTable from "@/components/Step4RecordsTable";
-import AnalysisTab from "@/components/AnalysisTab";
-import { Zap, Compass } from "lucide-react";
+import { Sparkles, Database, CheckCircle2, Clock } from "lucide-react";
 
-export default function MatchProfesorAsignaturaPage() {
-  // ── Navegación entre Sub-Pestañas ──
-  const [activeTab, setActiveTab] = useState<"generator" | "analysis">("generator");
+const BASE_PATH = "/embed-asignatura";
 
+export default function EmbedAsignaturaPage() {
   // ── Estados de columnas y datos ──
   const [columns, setColumns] = useState<Array<{ name: string; type: string }>>([]);
   const [sourceColumn, setSourceColumn] = useState<string>("nombre");
@@ -78,7 +76,7 @@ export default function MatchProfesorAsignaturaPage() {
   // ── Cargar Columnas ──
   const loadColumns = useCallback(async () => {
     try {
-      const res = await fetch("/match-profesor-asignatura/api/table-columns");
+      const res = await fetch(`${BASE_PATH}/api/table-columns`);
       const data = await res.json();
 
       if (data.success && Array.isArray(data.columns)) {
@@ -110,7 +108,7 @@ export default function MatchProfesorAsignaturaPage() {
     setLoadingRecords(true);
     try {
       const res = await fetch(
-        `/match-profesor-asignatura/api/table-records?limit=50&targetColumn=${encodeURIComponent(
+        `${BASE_PATH}/api/table-records?limit=50&targetColumn=${encodeURIComponent(
           targetCol
         )}`
       );
@@ -157,7 +155,7 @@ export default function MatchProfesorAsignaturaPage() {
     try {
       // 1. Asegurar columna destino
       addLog(`Comprobando existencia de columna '${targetColumn}' en Supabase...`);
-      const ensureRes = await fetch("/match-profesor-asignatura/api/ensure-column", {
+      const ensureRes = await fetch(`${BASE_PATH}/api/ensure-column`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -178,7 +176,7 @@ export default function MatchProfesorAsignaturaPage() {
 
       // 2. Invocar API de generación
       addLog("Llamando a Jina AI API (jina-embeddings-v2-base-es)...");
-      const genRes = await fetch("/match-profesor-asignatura/api/generate-embeddings", {
+      const genRes = await fetch(`${BASE_PATH}/api/generate-embeddings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -258,20 +256,21 @@ export default function MatchProfesorAsignaturaPage() {
             >
               <PrademLogo className="h-9 w-9 text-[#C8A2C8]" />
               <span className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-indigo-500/40 text-[11px] ring-2 ring-slate-950">
-                🎯
+                ⚡
               </span>
             </a>
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold text-white tracking-tight">
-                  06 Match Profesor - Asignatura
+                  06 Generador de Embeddings de Asignatura
                 </h1>
                 <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-[10px] font-semibold text-indigo-300 border border-indigo-500/30">
                   Satélite Pradem
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Generador de Embeddings con Jina AI e inserción en <code className="text-amber-300 font-mono">asignaturas_extraidas</code>
+                Generación de vectores densos con Jina AI e inserción en{" "}
+                <code className="text-amber-300 font-mono">asignaturas_extraidas</code>
               </p>
             </div>
           </div>
@@ -286,114 +285,99 @@ export default function MatchProfesorAsignaturaPage() {
         </div>
       </header>
 
-      {/* ── Contenido Principal con Sub-Pestañas ── */}
-      <div className="mx-auto max-w-5xl px-6 py-8 space-y-6">
-        {/* ── Barra de Sub-Pestañas de Navegación ── */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setActiveTab("generator")}
-              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs sm:text-sm font-semibold transition ${
-                activeTab === "generator"
-                  ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-lg shadow-indigo-500/25 border border-indigo-400/30"
-                  : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10 border border-white/5"
-              }`}
-            >
-              <Zap className="h-4 w-4 text-amber-300" />
-              <span>Generador embeddings</span>
-            </button>
+      {/* ── Contenido Principal ── */}
+      <div className="mx-auto max-w-5xl px-6 py-8 space-y-8">
+        {/* ── Barra Superior de Resumen y Estado ── */}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.02] px-5 py-3.5 backdrop-blur-sm">
+          <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-xs">
+            <div className="flex items-center gap-2">
+              <Database className="h-4 w-4 text-indigo-400" />
+              <span className="text-slate-400">Total en BD:</span>
+              <span className="font-mono font-semibold text-white">
+                {loadingInitial ? "..." : totalRecords}
+              </span>
+            </div>
 
-            <button
-              onClick={() => setActiveTab("analysis")}
-              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs sm:text-sm font-semibold transition ${
-                activeTab === "analysis"
-                  ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-lg shadow-indigo-500/25 border border-indigo-400/30"
-                  : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10 border border-white/5"
-              }`}
-            >
-              <Compass className="h-4 w-4 text-indigo-400" />
-              <span>Análisis embeddings</span>
-              {withEmbeddingCount > 0 && (
-                <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] text-emerald-300 border border-emerald-500/30 font-mono">
-                  {withEmbeddingCount}
-                </span>
-              )}
-            </button>
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+              <span className="text-slate-400">Con Embeddings:</span>
+              <span className="font-mono font-semibold text-emerald-400">
+                {loadingInitial ? "..." : withEmbeddingCount}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Clock className="h-4 w-4 text-amber-400" />
+              <span className="text-slate-400">Pendientes:</span>
+              <span className="font-mono font-semibold text-amber-300">
+                {loadingInitial ? "..." : withoutEmbeddingCount}
+              </span>
+            </div>
           </div>
 
-          <div className="text-xs text-slate-400 flex items-center gap-1.5">
-            <span className="font-mono text-indigo-400">{records.length}</span> asignaturas cargadas
+          <div className="flex items-center gap-2 text-xs">
+            <span className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-[11px] font-mono text-indigo-300">
+              <Sparkles className="h-3 w-3 text-indigo-400" />
+              jina-embeddings-v2-base-es (768d)
+            </span>
           </div>
         </div>
 
-        {/* ── SUB-PESTAÑA 1: Generador de Embeddings (Formato Vertical) ── */}
-        {activeTab === "generator" && (
-          <div className="space-y-8">
-            {/* Paso 1: Diagnóstico de Conexión y API Key */}
-            <Step1ConnectionStatus
-              loading={loadingRecords || loadingInitial}
-              totalRecords={totalRecords}
-              withEmbeddingCount={withEmbeddingCount}
-              withoutEmbeddingCount={withoutEmbeddingCount}
-              targetColumnName={targetColumn}
-              tableExists={tableExists}
-              jinaApiKey={jinaApiKey}
-              onApiKeyChange={handleApiKeyChange}
-              onRefreshStats={() => {
-                loadColumns();
-                loadRecords();
-              }}
-            />
-
-            {/* Paso 2: Configuración de Columnas y Modelo */}
-            <Step2EmbeddingConfig
-              columns={columns}
-              sourceColumn={sourceColumn}
-              onSourceColumnChange={setSourceColumn}
-              targetColumn={targetColumn}
-              onTargetColumnChange={setTargetColumn}
-              mode={mode}
-              onModeChange={setMode}
-              sampleValue={sampleValue}
-              existingTargetColumn={existingTargetColumn}
-            />
-
-            {/* Paso 3: Botón de Acción Principal y Progreso */}
-            <Step3GenerateAction
-              isGenerating={isGenerating}
-              onGenerate={handleGenerateEmbeddings}
-              sourceColumn={sourceColumn}
-              targetColumn={targetColumn}
-              hasApiKey={Boolean(jinaApiKey && jinaApiKey.trim().length > 0)}
-              tableExists={tableExists}
-              progressPercentage={progressPercentage}
-              statusMessage={statusMessage}
-              logs={logs}
-              lastResult={lastResult}
-            />
-
-            {/* Paso 4: Visor de Registros y Auditoría */}
-            <Step4RecordsTable
-              records={records as any}
-              loading={loadingRecords}
-              totalRecords={totalRecords}
-              sourceColumn={sourceColumn}
-              targetColumn={targetColumn}
-              onRefresh={() => loadRecords(targetColumn)}
-            />
-          </div>
-        )}
-
-        {/* ── SUB-PESTAÑA 2: Análisis de Embeddings (Match Semántico + Gráfica t-SNE 2D) ── */}
-        {activeTab === "analysis" && (
-          <AnalysisTab
-            columns={columns}
-            records={records}
+        {/* ── Flujo Guiado en 4 Pasos ── */}
+        <div className="space-y-8">
+          {/* Paso 1: Diagnóstico de Conexión y API Key */}
+          <Step1ConnectionStatus
+            loading={loadingRecords || loadingInitial}
+            totalRecords={totalRecords}
+            withEmbeddingCount={withEmbeddingCount}
+            withoutEmbeddingCount={withoutEmbeddingCount}
+            targetColumnName={targetColumn}
+            tableExists={tableExists}
             jinaApiKey={jinaApiKey}
-            defaultEmbeddingCol={targetColumn}
-            onRefreshRecords={() => loadRecords(targetColumn)}
+            onApiKeyChange={handleApiKeyChange}
+            onRefreshStats={() => {
+              loadColumns();
+              loadRecords();
+            }}
           />
-        )}
+
+          {/* Paso 2: Configuración de Columnas y Modelo */}
+          <Step2EmbeddingConfig
+            columns={columns}
+            sourceColumn={sourceColumn}
+            onSourceColumnChange={setSourceColumn}
+            targetColumn={targetColumn}
+            onTargetColumnChange={setTargetColumn}
+            mode={mode}
+            onModeChange={setMode}
+            sampleValue={sampleValue}
+            existingTargetColumn={existingTargetColumn}
+          />
+
+          {/* Paso 3: Botón de Acción Principal y Progreso */}
+          <Step3GenerateAction
+            isGenerating={isGenerating}
+            onGenerate={handleGenerateEmbeddings}
+            sourceColumn={sourceColumn}
+            targetColumn={targetColumn}
+            hasApiKey={Boolean(jinaApiKey && jinaApiKey.trim().length > 0)}
+            tableExists={tableExists}
+            progressPercentage={progressPercentage}
+            statusMessage={statusMessage}
+            logs={logs}
+            lastResult={lastResult}
+          />
+
+          {/* Paso 4: Visor de Registros y Auditoría */}
+          <Step4RecordsTable
+            records={records as any}
+            loading={loadingRecords}
+            totalRecords={totalRecords}
+            sourceColumn={sourceColumn}
+            targetColumn={targetColumn}
+            onRefresh={() => loadRecords(targetColumn)}
+          />
+        </div>
       </div>
     </main>
   );

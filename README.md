@@ -1,6 +1,6 @@
-# 🎯 06 Match Profesor - Asignatura — Herramienta Satélite de Pradem
+# ⚡ 06 Generador de Embeddings de Asignatura — Herramienta Satélite de Pradem
 
-> Herramienta para la generación de **embeddings vectoriales** en la tabla `asignaturas_extraidas` de Supabase utilizando la API de **Jina AI** (`jina-embeddings-v2-base-es`) y el cálculo de **matching semántico** entre profesores y materias.
+> Herramienta satélite para la generación de **embeddings vectoriales** en la tabla `asignaturas_extraidas` de Supabase utilizando la API de **Jina AI** (`jina-embeddings-v2-base-es`) e inserción optimizada por lotes.
 
 ---
 
@@ -11,15 +11,14 @@ Esta herramienta se integra al ecosistema de Pradem mediante proxy inverso:
 ```
 Pradem Core (puerto 3000)
     │
-    ▼ (Rewrites /match-profesor-asignatura/*)
-06matchProfesorAsignatura (puerto 3003, basePath: /match-profesor-asignatura)
-    ├── Frontend: Formato vertical intuitivo (5 pasos guiados)
+    ▼ (Rewrites /embed-asignatura/*)
+06embedAsignatura (puerto 3003, basePath: /embed-asignatura)
+    ├── Frontend: Formato vertical intuitivo (4 pasos guiados)
     ├── API Routes:
-    │     ├── GET  /api/table-columns      → Inspección de columnas
-    │     ├── POST /api/ensure-column      → Verificación y creación dinámica en Supabase
-    │     ├── GET  /api/table-records      → Consulta y métricas de registros
-    │     ├── POST /api/generate-embeddings→ Generación por lotes con Jina AI
-    │     └── POST /api/semantic-match     → Similitud coseno profesor ↔ materias
+    │     ├── GET  /api/table-columns       → Inspección de columnas
+    │     ├── POST /api/ensure-column       → Verificación y creación dinámica en Supabase
+    │     ├── GET  /api/table-records       → Consulta y métricas de registros
+    │     └── POST /api/generate-embeddings → Generación por lotes con Jina AI
     └── Supabase (public.asignaturas_extraidas)
 ```
 
@@ -27,18 +26,17 @@ Pradem Core (puerto 3000)
 
 ## ⚡ Características Principales
 
-1. **Formato Vertical Intuitivo**:
-   - **Paso 1**: Diagnóstico de conexión a Supabase y configuración de `JINA_API_KEY`.
-   - **Paso 2**: Selector dinámico de columna origen (`nombre`, `codigo`, etc.), campo para nombrar columna destino (`embedding`) y modo de ejecución (solo pendientes vs regenerar todos).
-   - **Paso 3**: Botón destacado de generación con barra de progreso reactiva y log de terminal en vivo.
-   - **Paso 4**: Tabla de auditoría para verificar vectores generados (768 dimensiones) e inspeccionar sus valores numéricos.
-   - **Paso 5**: Probador semántico interactivo para ingresar el perfil de un docente y obtener las asignaturas más compatibles ordenadas por porcentaje de afinidad.
+1. **Formato Vertical Intuitivo (4 Pasos Guiados)**:
+   - **Paso 1**: Diagnóstico de conexión a Supabase, métricas en vivo de asignaturas con/sin vector y configuración segura de `JINA_API_KEY`.
+   - **Paso 2**: Selector dinámico de columna origen (`nombre`, `codigo`, etc.), campo para nombrar columna destino (`embedding`) y selector de modo de procesamiento (solo pendientes vs regenerar todos).
+   - **Paso 3**: Botón destacado de generación e inserción directa con barra de progreso reactiva, resumen de métricas y consola de logs en tiempo real.
+   - **Paso 4**: Tabla de auditoría con buscador en vivo, filtros y modal para inspeccionar coeficientes numéricos de los vectores (768 dimensiones).
 
 2. **Modelo de Embeddings Jina AI**:
    - Modelo: `jina-embeddings-v2-base-es`
    - Ventana de contexto: 8192 tokens
    - Dimensiones del vector: 768
-   - Procesamiento optimizado por lotes (batches de hasta 50 textos)
+   - Procesamiento optimizado por lotes (batches configurables)
 
 ---
 
@@ -54,7 +52,7 @@ JINA_API_KEY=jina_...
 
 ### 2. Iniciar Servidor de Desarrollo
 ```bash
-cd 06matchProfesorAsignatura
+cd 06embedAsignatura
 npm run dev
 ```
-La herramienta se ejecutará en: `http://localhost:3003/match-profesor-asignatura`
+La herramienta se ejecutará en: `http://localhost:3003/embed-asignatura`

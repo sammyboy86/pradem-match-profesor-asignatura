@@ -1,5 +1,5 @@
 -- ══════════════════════════════════════════════════════════════════════
--- Script SQL de Soporte para '06matchProfesorAsignatura'
+-- Script SQL de Soporte para '06embedAsignatura' (Generador de Embeddings)
 -- ══════════════════════════════════════════════════════════════════════
 -- La tabla 'asignaturas_extraidas' almacena los embeddings en formato jsonb
 -- (array de floats de 768 dimensiones provisto por Jina AI).

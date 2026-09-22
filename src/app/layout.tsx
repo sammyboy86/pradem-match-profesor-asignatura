@@ -13,13 +13,13 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "06 Match Profesor Asignatura | Pradem",
+  title: "06 Generador de Embeddings de Asignatura | Pradem",
   description:
-    "Herramienta para generar embeddings con Jina AI e interactuar con el matching semántico entre profesores y asignaturas en Supabase.",
+    "Herramienta satélite de Pradem para generar embeddings vectoriales de asignaturas con Jina AI e insertarlos en Supabase.",
 };
 
 /**
- * Layout raíz de 06matchProfesorAsignatura.
+ * Layout raíz de 06embedAsignatura.
  * Herramienta satélite de Pradem Core.
  */
 export default function RootLayout({
