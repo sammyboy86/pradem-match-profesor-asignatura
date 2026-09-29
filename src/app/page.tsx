@@ -8,7 +8,40 @@ import Step3GenerateAction from "@/components/Step3GenerateAction";
 import Step4RecordsTable from "@/components/Step4RecordsTable";
 import { Sparkles, Database, CheckCircle2, Clock } from "lucide-react";
 
-const BASE_PATH = "/embed-asignatura";
+// Obtener el prefijo base de las rutas (soporta tanto /admin-embed-asignatura como /embed-asignatura)
+const getBasePath = (): string => {
+  if (typeof window !== "undefined") {
+    if (window.location.pathname.startsWith("/admin-embed-asignatura")) {
+      return "/admin-embed-asignatura";
+    }
+    if (window.location.pathname.startsWith("/embed-asignatura")) {
+      return "/embed-asignatura";
+    }
+  }
+  return process.env.NEXT_PUBLIC_BASE_PATH || "/admin-embed-asignatura";
+};
+
+// Cliente fetch seguro que valida el tipo de contenido antes de parsear JSON
+async function safeFetchJson<T = any>(endpoint: string, init?: RequestInit): Promise<T> {
+  const basePath = getBasePath();
+  const url = `${basePath}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
+  const res = await fetch(url, init);
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await res.text();
+    const snippet = text.slice(0, 100).replace(/\s+/g, " ");
+    throw new Error(
+      `El servidor respondió con ${res.status} (${res.statusText || "No OK"}) en '${url}', pero no devolvió JSON: "${snippet}"`
+    );
+  }
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP ${res.status}: Error en la respuesta del servidor`);
+  }
+  return data;
+}
 
 export default function EmbedAsignaturaPage() {
   // ── Estados de columnas y datos ──
@@ -76,8 +109,12 @@ export default function EmbedAsignaturaPage() {
   // ── Cargar Columnas ──
   const loadColumns = useCallback(async () => {
     try {
-      const res = await fetch(`${BASE_PATH}/api/table-columns`);
-      const data = await res.json();
+      const data = await safeFetchJson<{
+        success: boolean;
+        columns?: Array<{ name: string; type: string }>;
+        tableExists?: boolean;
+        error?: string;
+      }>("/api/table-columns");
 
       if (data.success && Array.isArray(data.columns)) {
         setColumns(data.columns);
@@ -107,12 +144,16 @@ export default function EmbedAsignaturaPage() {
   const loadRecords = useCallback(async (targetCol: string = targetColumn) => {
     setLoadingRecords(true);
     try {
-      const res = await fetch(
-        `${BASE_PATH}/api/table-records?limit=50&targetColumn=${encodeURIComponent(
-          targetCol
-        )}`
+      const data = await safeFetchJson<{
+        success: boolean;
+        records?: Array<Record<string, unknown>>;
+        totalCount?: number;
+        countWithEmbedding?: number;
+        countWithoutEmbedding?: number;
+        error?: string;
+      }>(
+        `/api/table-records?limit=50&targetColumn=${encodeURIComponent(targetCol)}`
       );
-      const data = await res.json();
 
       if (data.success) {
         setRecords(data.records || []);
@@ -155,7 +196,14 @@ export default function EmbedAsignaturaPage() {
     try {
       // 1. Asegurar columna destino
       addLog(`Comprobando existencia de columna '${targetColumn}' en Supabase...`);
-      const ensureRes = await fetch(`${BASE_PATH}/api/ensure-column`, {
+      const ensureData = await safeFetchJson<{
+        success: boolean;
+        created?: boolean;
+        exists?: boolean;
+        column?: string;
+        message?: string;
+        error?: string;
+      }>("/api/ensure-column", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -164,7 +212,6 @@ export default function EmbedAsignaturaPage() {
         }),
       });
 
-      const ensureData = await ensureRes.json();
       if (ensureData.created) {
         addLog(`Columna '${targetColumn}' creada exitosamente en Supabase.`);
       } else {
@@ -176,7 +223,15 @@ export default function EmbedAsignaturaPage() {
 
       // 2. Invocar API de generación
       addLog("Llamando a Jina AI API (jina-embeddings-v2-base-es)...");
-      const genRes = await fetch(`${BASE_PATH}/api/generate-embeddings`, {
+      const genData = await safeFetchJson<{
+        success: boolean;
+        totalUpdated: number;
+        tokensUsed: number;
+        durationSeconds: number;
+        message: string;
+        errors?: string[];
+        error?: string;
+      }>("/api/generate-embeddings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -189,10 +244,7 @@ export default function EmbedAsignaturaPage() {
         }),
       });
 
-      setProgressPercentage(75);
-      const genData = await genRes.json();
-
-      if (!genRes.ok || !genData.success) {
+      if (!genData.success) {
         throw new Error(genData.error || "Error al procesar los embeddings.");
       }
 

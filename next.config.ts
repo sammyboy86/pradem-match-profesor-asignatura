@@ -11,7 +11,11 @@ const nextConfig: NextConfig = {
   //   source: "/mi-herramienta/:path*"
   //   destination: `${TOOL_URL}/mi-herramienta/:path*`
   //
-  basePath: "/embed-asignatura",
+  basePath: "/admin-embed-asignatura",
+
+  env: {
+    NEXT_PUBLIC_BASE_PATH: "/admin-embed-asignatura",
+  },
 
   // Necesario para que las imágenes funcionen correctamente
   images: {

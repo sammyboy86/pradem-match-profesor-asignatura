@@ -11,8 +11,8 @@ Esta herramienta se integra al ecosistema de Pradem mediante proxy inverso:
 ```
 Pradem Core (puerto 3000)
     │
-    ▼ (Rewrites /embed-asignatura/*)
-06embedAsignatura (puerto 3003, basePath: /embed-asignatura)
+    ▼ (Rewrites /admin-embed-asignatura/*)
+06embedAsignatura (puerto 3006, basePath: /admin-embed-asignatura)
     ├── Frontend: Formato vertical intuitivo (4 pasos guiados)
     ├── API Routes:
     │     ├── GET  /api/table-columns       → Inspección de columnas
@@ -55,4 +55,4 @@ JINA_API_KEY=jina_...
 cd 06embedAsignatura
 npm run dev
 ```
-La herramienta se ejecutará en: `http://localhost:3003/embed-asignatura`
+La herramienta se ejecutará en: `http://localhost:3006/admin-embed-asignatura`
