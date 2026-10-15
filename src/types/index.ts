@@ -56,6 +56,7 @@ export interface MatchResultItem {
   contenido_tematico: string;
   compositeSimilarity: number;
   fieldSimilarities: Record<string, number>;
+  match_nombre?: boolean;
 }
 
 export interface ProfesorMatchResult {

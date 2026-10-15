@@ -104,6 +104,23 @@ export async function POST(req: NextRequest) {
           }
         }
 
+        // Obtener la bandera match_nombre de la base de datos para todos los candidatos
+        const candidateIds = Array.from(candidateMap.keys());
+        const matchNombreMap = new Map<number, boolean>();
+
+        if (candidateIds.length > 0) {
+          const { data: flagRows } = await supabase
+            .from("asignaturas")
+            .select("id, match_nombre")
+            .in("id", candidateIds);
+
+          if (Array.isArray(flagRows)) {
+            flagRows.forEach((r) => {
+              matchNombreMap.set(r.id, Boolean(r.match_nombre));
+            });
+          }
+        }
+
         // Calcular similitud compuesta ponderada: sum(w_i * Sim_i)
         const scoredItems: MatchResultItem[] = [];
 
@@ -131,21 +148,50 @@ export async function POST(req: NextRequest) {
               fieldSimilarities: Object.fromEntries(
                 Object.entries(candidate.fieldSims).map(([k, v]) => [k, Number(v.toFixed(4))])
               ),
+              match_nombre: Boolean(matchNombreMap.get(candidate.id)),
             });
           }
         }
 
-        // Ordenar SIEMPRE de MAYOR A MENOR similitud compuesta
+        // Ordenar candidatos preliminarmente de MAYOR A MENOR similitud compuesta
         scoredItems.sort((a, b) => b.compositeSimilarity - a.compositeSimilarity);
 
         // Selección final de asignaturas:
-        // - Modo 'threshold': Devuelve todas las que superan el umbral (o hasta topK si se especifica un límite)
-        // - Modo 'topK': Devuelve las mejores K asignaturas
-        // - Modo 'both': Devuelve las mejores K que además superan el umbral
-        const finalMatches =
-          filterMode === "threshold"
-            ? (topK > 0 ? scoredItems.slice(0, topK) : scoredItems)
-            : scoredItems.slice(0, topK);
+        // Cuando estamos limitando por cantidad (topK o both):
+        // Las asignaturas con match_nombre=True se incluyen pero NO se descuentan del cupo K
+        // (es decir: se retornan todas las asignaturas con match_nombre=True MÁS las K mejores semánticas).
+        let finalMatches: MatchResultItem[] = [];
+
+        if (filterMode === "threshold") {
+          // En modo umbral, todas las que pasaron el filtro se incluyen
+          if (topK > 0 && topK < scoredItems.length) {
+            let semanticCount = 0;
+            for (const item of scoredItems) {
+              if (item.match_nombre) {
+                finalMatches.push(item);
+              } else if (semanticCount < topK) {
+                finalMatches.push(item);
+                semanticCount++;
+              }
+            }
+          } else {
+            finalMatches = scoredItems;
+          }
+        } else {
+          // Modo 'topK' o 'both': Asignaturas con match_nombre=True NO consumen cupo del Top K
+          let semanticCount = 0;
+          for (const item of scoredItems) {
+            if (item.match_nombre) {
+              finalMatches.push(item);
+            } else if (semanticCount < topK) {
+              finalMatches.push(item);
+              semanticCount++;
+            }
+          }
+        }
+
+        // Ordenar SIEMPRE de MAYOR A MENOR similitud compuesta
+        finalMatches.sort((a, b) => b.compositeSimilarity - a.compositeSimilarity);
 
         results.push({
           profesor: prof,

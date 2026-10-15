@@ -373,6 +373,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         if (m) {
           rowData[`${prefix} - Asignatura`] = m.nombre;
           rowData[`${prefix} - Clave`] = m.clave;
+          rowData[`${prefix} - Tipo`] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
           rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
 
           // Desglose por criterio
@@ -654,11 +655,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 </p>
               </div>
 
-              {totalCatalogCount > 0 && (
-                <span className="rounded-lg bg-indigo-500/15 border border-indigo-500/30 px-2.5 py-1 text-[11px] font-mono text-indigo-300">
-                  Total en catálogo: {totalCatalogCount} asignaturas
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-lg bg-purple-500/15 border border-purple-500/30 px-2.5 py-1 text-[11px] font-medium text-purple-300 flex items-center gap-1">
+                  <span>🎯 match_nombre=True no consume cupo</span>
                 </span>
-              )}
+                {totalCatalogCount > 0 && (
+                  <span className="rounded-lg bg-indigo-500/15 border border-indigo-500/30 px-2.5 py-1 text-[11px] font-mono text-indigo-300">
+                    Total en catálogo: {totalCatalogCount} asignaturas
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Selector de Modos (3 Tabs / Cards) */}
@@ -1210,6 +1216,12 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                       {matchItem.clave && (
                                         <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-mono text-indigo-300">
                                           {matchItem.clave}
+                                        </span>
+                                      )}
+                                      {matchItem.match_nombre && (
+                                        <span className="rounded-md bg-purple-500/20 text-purple-300 border border-purple-500/40 px-2 py-0.5 text-[10px] font-semibold flex items-center gap-1">
+                                          <span>🎯 Match Nombre</span>
+                                          <span className="text-[9px] text-purple-200/80 font-normal">(Exento de cupo Top K)</span>
                                         </span>
                                       )}
                                     </div>

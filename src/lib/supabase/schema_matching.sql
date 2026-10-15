@@ -50,6 +50,7 @@ RETURNS TABLE (
   clave TEXT,
   nombre TEXT,
   contenido_tematico TEXT,
+  match_nombre BOOLEAN,
   similarity FLOAT
 )
 LANGUAGE plpgsql
@@ -61,6 +62,7 @@ BEGIN
     a.clave,
     a.nombre,
     a.contenido_tematico,
+    a.match_nombre,
     (1 - (a.embedding_768 <=> query_embedding))::FLOAT AS similarity
   FROM public.asignaturas a
   WHERE a.embedding_768 IS NOT NULL
