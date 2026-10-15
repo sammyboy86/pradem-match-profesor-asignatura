@@ -20,18 +20,29 @@ import {
   BarChart3,
   Percent,
   UserCheck,
+  Check,
+  X,
+  Layers,
+  Eye,
+  EyeOff,
+  Trash2,
+  ListFilter,
+  BookOpen,
 } from "lucide-react";
 import {
   Profesor,
   QueryConfig,
   ProfesorMatchResult,
   MatchResultItem,
+  FilteredAsignatura,
+  FilterClavesResponse,
 } from "@/types";
 import {
   parseSpreadsheetFile,
   apiFetch,
   exportToExcel,
   exportToCsv,
+  cleanClave,
 } from "@/lib/utils";
 
 interface TabMatchingProps {
@@ -39,6 +50,23 @@ interface TabMatchingProps {
 }
 
 export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
+  // ── Estados de Filtro Inicial de Asignaturas (Paso 1: Filtro por Claves) ──
+  const [filterFile, setFilterFile] = useState<File | null>(null);
+  const [filterHeaders, setFilterHeaders] = useState<string[]>([]);
+  const [filterRows, setFilterRows] = useState<Record<string, string>[]>([]);
+  const [filterKeyColumn, setFilterKeyColumn] = useState<string>("");
+  const [isFilterParsing, setIsFilterParsing] = useState(false);
+  const [isFilterActive, setIsFilterActive] = useState(true);
+  const [uniqueCleanedClaves, setUniqueCleanedClaves] = useState<string[]>([]);
+  const [filteredAsignaturas, setFilteredAsignaturas] = useState<FilteredAsignatura[]>([]);
+  const [unmatchedClaves, setUnmatchedClaves] = useState<string[]>([]);
+  const [isLoadingFilterMatches, setIsLoadingFilterMatches] = useState(false);
+  const [filterError, setFilterError] = useState<string | null>(null);
+  const [isFilterPreviewOpen, setIsFilterPreviewOpen] = useState(false);
+  const [filterPreviewTab, setFilterPreviewTab] = useState<"matched" | "unmatched">("matched");
+  const [filterSearchTerm, setFilterSearchTerm] = useState("");
+  const filterFileInputRef = useRef<HTMLInputElement>(null);
+
   // ── Estados de Archivo de Profesores ──
   const [file, setFile] = useState<File | null>(null);
   const [fileHeaders, setFileHeaders] = useState<string[]>([]);
@@ -83,6 +111,129 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     }
     loadCatalogCount();
   }, []);
+
+  // ── Conteo Efectivo de Asignaturas (Filtradas vs Catálogo Completo) ──
+  const isFilterEffective = isFilterActive && filteredAsignaturas.length > 0;
+  const effectiveCatalogCount = isFilterEffective ? filteredAsignaturas.length : totalCatalogCount;
+
+  // Ajustar Top K automáticamente si excede el catálogo efectivo
+  useEffect(() => {
+    if (effectiveCatalogCount > 0 && topK > effectiveCatalogCount) {
+      setTopK(effectiveCatalogCount);
+    }
+  }, [effectiveCatalogCount, topK]);
+
+  // ── Procesamiento de Filtro de Claves (Limpieza Preliminar + Consulta) ──
+  const processFilterColumn = async (rows: Record<string, string>[], colName: string) => {
+    if (!rows.length || !colName) {
+      setFilteredAsignaturas([]);
+      setUnmatchedClaves([]);
+      setUniqueCleanedClaves([]);
+      return;
+    }
+
+    setFilterError(null);
+    setIsLoadingFilterMatches(true);
+
+    try {
+      // Limpieza preliminar: quitar caracteres no alfa-numéricos y pasar a mayúsculas
+      const cleaned = rows
+        .map((r) => cleanClave(r[colName]))
+        .filter((k) => k.length > 0);
+
+      const unique = Array.from(new Set(cleaned));
+      setUniqueCleanedClaves(unique);
+
+      if (unique.length === 0) {
+        setFilteredAsignaturas([]);
+        setUnmatchedClaves([]);
+        setFilterError("No se encontraron claves con caracteres alfa-numéricos válidos en la columna seleccionada.");
+        return;
+      }
+
+      // Consultar endpoint para validar contra catálogo de asignaturas en Supabase
+      const res = await apiFetch<FilterClavesResponse>("/api/asignaturas/filter-claves", {
+        method: "POST",
+        body: JSON.stringify({ claves: unique }),
+      });
+
+      if (res.success) {
+        setFilteredAsignaturas(res.matchedAsignaturas || []);
+        setUnmatchedClaves(res.unmatchedClaves || []);
+        setIsFilterActive(true);
+      } else {
+        setFilterError(res.error || "Error al buscar asignaturas por claves en el catálogo.");
+      }
+    } catch (err: any) {
+      console.error("Error al procesar filtro de claves:", err);
+      setFilterError(err.message || "Error al conectar con el servidor para filtrar claves.");
+    } finally {
+      setIsLoadingFilterMatches(false);
+    }
+  };
+
+  const handleFilterFileSelected = async (selectedFile: File) => {
+    setFilterFile(selectedFile);
+    setIsFilterParsing(true);
+    setFilterError(null);
+
+    try {
+      const { headers, rows } = await parseSpreadsheetFile(selectedFile);
+      setFilterHeaders(headers);
+      setFilterRows(rows);
+
+      // Detección automática inteligente de la columna de claves
+      const normalize = (s: string) =>
+        s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+
+      const detected =
+        headers.find((h) => {
+          const n = normalize(h);
+          return (
+            n === "clave" ||
+            n.includes("clave") ||
+            n === "cve" ||
+            n.includes("cve") ||
+            n.includes("codigo") ||
+            n.includes("code") ||
+            n === "id" ||
+            n.includes("asignatura") ||
+            n.includes("materia")
+          );
+        }) || headers[0] || "";
+
+      setFilterKeyColumn(detected);
+      await processFilterColumn(rows, detected);
+    } catch (err: any) {
+      alert(err.message || "Error al procesar archivo de claves");
+      setFilterFile(null);
+    } finally {
+      setIsFilterParsing(false);
+    }
+  };
+
+  const handleFilterDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFilterFileSelected(e.dataTransfer.files[0]);
+    }
+  };
+
+  const handleClearFilter = () => {
+    setFilterFile(null);
+    setFilterHeaders([]);
+    setFilterRows([]);
+    setFilterKeyColumn("");
+    setUniqueCleanedClaves([]);
+    setFilteredAsignaturas([]);
+    setUnmatchedClaves([]);
+    setIsFilterActive(false);
+    setFilterError(null);
+    setIsFilterPreviewOpen(false);
+    if (filterFileInputRef.current) {
+      filterFileInputRef.current.value = "";
+    }
+  };
 
   // ── Inicializar Configuraciones de Query al Cargar Archivo ──
   const setupQueryConfigs = (headers: string[], detectedNameCol: string) => {
@@ -202,6 +353,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       return;
     }
 
+    if (isFilterActive && filterFile && filteredAsignaturas.length === 0) {
+      alert("El filtro de asignaturas está activo pero no coincide con ninguna asignatura en la base de datos. Revisa el archivo o desactiva el filtro.");
+      return;
+    }
+
     setIsMatching(true);
     setMatchProgress(5);
     setMatchStatusText("Iniciando matching multimodal con Gemini...");
@@ -225,8 +381,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         const end = Math.min(start + BATCH_SIZE, profesoresList.length);
         const batch = profesoresList.slice(start, end);
 
+        const filterSuffix = isFilterEffective
+          ? ` sobre ${filteredAsignaturas.length} asignaturas filtradas`
+          : "";
         setMatchStatusText(
-          `Procesando profesores ${start + 1} a ${end} de ${profesoresList.length}...`
+          `Procesando profesores ${start + 1} a ${end} de ${profesoresList.length}${filterSuffix}...`
         );
         setMatchProgress(10 + Math.round(((b + 0.5) / totalBatches) * 85));
 
@@ -241,7 +400,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             queryConfigs: activeConfigs,
             filterMode,
             threshold: filterMode === "topK" ? 0.0 : threshold,
-            topK: filterMode === "threshold" ? (totalCatalogCount || 500) : topK,
+            topK: filterMode === "threshold" ? (effectiveCatalogCount || 500) : topK,
+            filterAsignaturaIds: isFilterEffective ? filteredAsignaturas.map((a) => a.id) : undefined,
           }),
         });
 
@@ -400,9 +560,378 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     }
   };
 
+  // Filtrar asignaturas en el modal/cajón de previsualización de Paso 1
+  const filteredPreviewAsignaturas = useMemo(() => {
+    if (!filterSearchTerm.trim()) return filteredAsignaturas;
+    const q = filterSearchTerm.toLowerCase();
+    return filteredAsignaturas.filter(
+      (a) =>
+        a.nombre.toLowerCase().includes(q) ||
+        (a.clave && a.clave.toLowerCase().includes(q)) ||
+        a.cleanClave.toLowerCase().includes(q)
+    );
+  }, [filteredAsignaturas, filterSearchTerm]);
+
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
-      {/* ── SECCIÓN 1: SUBIDA DE ARCHIVO DE PROFESORES ── */}
+      {/* ── PASO 1: FILTRO PRELIMINAR DE ASIGNATURAS POR CLAVES ── */}
+      <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6 backdrop-blur-sm shadow-xl space-y-6">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5">
+          <div className="flex items-center gap-3">
+            <div className="rounded-xl bg-cyan-500/10 p-2.5 text-cyan-400 border border-cyan-500/20">
+              <Filter className="h-5 w-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="rounded-md bg-cyan-500/20 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-cyan-300">
+                  Paso 1 &bull; Inicial
+                </span>
+                <h2 className="text-base font-bold text-white tracking-tight">
+                  Filtro Preliminar de Asignaturas (Claves)
+                </h2>
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Sube un archivo <code className="text-cyan-300 font-mono">.xlsx</code> o <code className="text-cyan-300 font-mono">.csv</code> con las claves para restringir el universo de matching. La matriz de distancias solo se correrá en estas asignaturas.
+              </p>
+            </div>
+          </div>
+
+          {/* Badge de Estado del Filtro */}
+          <div className="flex items-center gap-2">
+            {!filterFile ? (
+              <span className="rounded-xl border border-white/10 bg-slate-800/80 px-3 py-1.5 text-xs text-slate-400 flex items-center gap-1.5">
+                <span className="h-2 w-2 rounded-full bg-slate-400" />
+                Sin filtro activo ({totalCatalogCount > 0 ? `${totalCatalogCount} en catálogo` : "Catálogo completo"})
+              </span>
+            ) : isFilterEffective ? (
+              <div className="flex items-center gap-2">
+                <span className="rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-bold text-emerald-300 flex items-center gap-1.5 shadow-sm">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                  Filtro activo: {filteredAsignaturas.length} asignaturas
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsFilterActive(!isFilterActive)}
+                  className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-white/10 transition"
+                  title="Pausar o reactivar el filtro de claves"
+                >
+                  Pausar
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="rounded-xl border border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+                  Filtro pausado (Usando catálogo completo)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsFilterActive(true)}
+                  className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/20 transition font-semibold"
+                >
+                  Reactivar
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Zona Drag & Drop si no hay archivo de filtro */}
+        {!filterFile ? (
+          <div className="space-y-3">
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={handleFilterDrop}
+              onClick={() => filterFileInputRef.current?.click()}
+              className="group relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-white/15 bg-white/[0.01] p-8 text-center transition hover:border-cyan-500/50 hover:bg-cyan-500/[0.02] cursor-pointer"
+            >
+              <input
+                ref={filterFileInputRef}
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                onChange={(e) => {
+                  if (e.target.files?.[0]) handleFilterFileSelected(e.target.files[0]);
+                }}
+                className="hidden"
+              />
+              <div className="mb-3 rounded-2xl bg-cyan-500/10 p-3.5 text-cyan-400 border border-cyan-500/20 group-hover:scale-110 transition-transform">
+                <FileSpreadsheet className="h-7 w-7" />
+              </div>
+              <h3 className="text-sm font-semibold text-white">
+                Arrastra aquí el archivo con las claves de asignaturas o haz clic para examinar
+              </h3>
+              <p className="mt-1 text-xs text-slate-400 max-w-lg">
+                Formatos compatibles: <code className="text-cyan-300 font-mono">.xlsx</code>, <code className="text-cyan-300 font-mono">.xls</code> o <code className="text-cyan-300 font-mono">.csv</code>.
+              </p>
+              <div className="mt-3 flex items-center gap-2 text-[11px] text-cyan-300/90 bg-cyan-950/50 border border-cyan-800/40 px-3.5 py-1.5 rounded-xl">
+                <Sparkles className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+                <span>
+                  <strong>Limpieza preliminar automática:</strong> Se eliminan caracteres no alfa-numéricos (guiones, espacios, saltos de línea) y se pasa todo a mayúsculas para un match exacto con el catálogo.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 rounded-xl border border-white/5 bg-slate-950/40 px-4 py-2.5 text-xs text-slate-400">
+              <BookOpen className="h-4 w-4 text-cyan-400 shrink-0" />
+              <span>
+                <strong>Paso opcional:</strong> Si no cargas este filtro, el matching calculará distancias sobre todas las {totalCatalogCount > 0 ? `${totalCatalogCount} ` : ""}asignaturas del catálogo. Al cargar claves, la matriz de distancias solo se correrá en las asignaturas filtradas y solo se desplegarán esos matches.
+              </span>
+            </div>
+          </div>
+        ) : (
+          /* Vista de Filtro Cargado */
+          <div className="space-y-5">
+            {/* Barra de Controles y Selector de Columna */}
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-white/10 bg-slate-950/70 p-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-slate-300">
+                    Columna con Claves:
+                  </span>
+                  <select
+                    value={filterKeyColumn}
+                    onChange={(e) => {
+                      setFilterKeyColumn(e.target.value);
+                      processFilterColumn(filterRows, e.target.value);
+                    }}
+                    className="rounded-lg border border-white/15 bg-slate-900 px-3 py-1.5 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500 font-mono"
+                  >
+                    {filterHeaders.map((h) => (
+                      <option key={h} value={h}>
+                        {h}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <span className="text-xs text-slate-500 font-mono">
+                  ({filterRows.length} filas en archivo)
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => filterFileInputRef.current?.click()}
+                  className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-white/10 hover:text-white transition"
+                >
+                  Cambiar archivo
+                </button>
+                <input
+                  ref={filterFileInputRef}
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  onChange={(e) => {
+                    if (e.target.files?.[0]) handleFilterFileSelected(e.target.files[0]);
+                  }}
+                  className="hidden"
+                />
+
+                <button
+                  type="button"
+                  onClick={handleClearFilter}
+                  className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 hover:bg-red-500/20 transition flex items-center gap-1.5"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Quitar filtro</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Alerta de Error si ocurre */}
+            {filterError && (
+              <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-xs text-red-300 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
+                <span>{filterError}</span>
+              </div>
+            )}
+
+            {/* Métricas del Filtro tras Limpieza Preliminar */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="rounded-xl border border-white/10 bg-slate-950/60 p-3.5">
+                <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 flex items-center gap-1">
+                  <Check className="h-3 w-3 text-cyan-400" />
+                  Regla de Limpieza
+                </span>
+                <p className="text-xs font-mono font-bold text-cyan-300 mt-1">
+                  Alfanumérico &bull; MAYÚS
+                </p>
+                <span className="text-[10px] text-slate-500">
+                  Sin símbolos ni espacios
+                </span>
+              </div>
+
+              <div className="rounded-xl border border-white/10 bg-slate-950/60 p-3.5">
+                <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400">
+                  Claves Únicas Limpias
+                </span>
+                <p className="text-xl font-bold font-mono text-white mt-1">
+                  {uniqueCleanedClaves.length}
+                </p>
+                <span className="text-[10px] text-slate-500">
+                  de {filterRows.length} filas
+                </span>
+              </div>
+
+              <div className={`rounded-xl border p-3.5 ${
+                filteredAsignaturas.length > 0
+                  ? "border-emerald-500/30 bg-emerald-500/[0.04]"
+                  : "border-amber-500/30 bg-amber-500/[0.04]"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold tracking-wider ${
+                  filteredAsignaturas.length > 0 ? "text-emerald-400" : "text-amber-400"
+                }`}>
+                  Asignaturas en BD
+                </span>
+                <p className={`text-xl font-bold font-mono mt-1 ${
+                  filteredAsignaturas.length > 0 ? "text-emerald-300" : "text-amber-300"
+                }`}>
+                  {isLoadingFilterMatches ? "Buscando..." : filteredAsignaturas.length}
+                </p>
+                <span className="text-[10px] text-slate-500">
+                  {totalCatalogCount > 0 ? `de ${totalCatalogCount} en catálogo` : "coincidentes"}
+                </span>
+              </div>
+
+              <div className="rounded-xl border border-white/10 bg-slate-950/60 p-3.5">
+                <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400">
+                  Claves No Halladas
+                </span>
+                <p className={`text-xl font-bold font-mono mt-1 ${
+                  unmatchedClaves.length > 0 ? "text-amber-400" : "text-slate-400"
+                }`}>
+                  {isLoadingFilterMatches ? "..." : unmatchedClaves.length}
+                </p>
+                <span className="text-[10px] text-slate-500">
+                  {unmatchedClaves.length > 0 ? "no existen en BD" : "todas encontradas"}
+                </span>
+              </div>
+            </div>
+
+            {/* Botón para Desplegar Previsualización de Asignaturas Filtradas */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/5 pt-3">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsFilterPreviewOpen(!isFilterPreviewOpen);
+                    setFilterPreviewTab("matched");
+                  }}
+                  className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition ${
+                    isFilterPreviewOpen && filterPreviewTab === "matched"
+                      ? "bg-cyan-600 text-white"
+                      : "bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  {isFilterPreviewOpen && filterPreviewTab === "matched" ? (
+                    <EyeOff className="h-3.5 w-3.5" />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" />
+                  )}
+                  <span>Ver asignaturas filtradas ({filteredAsignaturas.length})</span>
+                </button>
+
+                {unmatchedClaves.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsFilterPreviewOpen(true);
+                      setFilterPreviewTab("unmatched");
+                    }}
+                    className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition ${
+                      isFilterPreviewOpen && filterPreviewTab === "unmatched"
+                        ? "bg-amber-600 text-white"
+                        : "bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20"
+                    }`}
+                  >
+                    <span>Ver claves no halladas ({unmatchedClaves.length})</span>
+                  </button>
+                )}
+              </div>
+
+              {isFilterEffective && (
+                <span className="text-[11px] text-emerald-400 font-mono">
+                  ✓ Matriz de distancias se correrá exclusivamente sobre estas {filteredAsignaturas.length} asignaturas
+                </span>
+              )}
+            </div>
+
+            {/* Cajón de Previsualización Expandible */}
+            {isFilterPreviewOpen && (
+              <div className="rounded-xl border border-white/10 bg-slate-950/80 p-4 space-y-3 animate-in fade-in duration-200">
+                {filterPreviewTab === "matched" ? (
+                  <>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="relative flex-1 min-w-[200px] max-w-sm">
+                        <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder="Buscar en asignaturas filtradas..."
+                          value={filterSearchTerm}
+                          onChange={(e) => setFilterSearchTerm(e.target.value)}
+                          className="w-full rounded-lg border border-white/15 bg-slate-900 pl-8 pr-3 py-1 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                        />
+                      </div>
+                      <span className="text-xs text-slate-400">
+                        Mostrando {filteredPreviewAsignaturas.length} de {filteredAsignaturas.length}
+                      </span>
+                    </div>
+
+                    <div className="max-h-60 overflow-y-auto rounded-lg border border-white/10">
+                      <table className="w-full text-left text-xs">
+                        <thead className="sticky top-0 bg-slate-900 text-slate-400 uppercase text-[10px] tracking-wider border-b border-white/10">
+                          <tr>
+                            <th className="px-3 py-2">#</th>
+                            <th className="px-3 py-2 font-mono text-cyan-300">Clave Limpia</th>
+                            <th className="px-3 py-2 text-slate-400">Clave Original BD</th>
+                            <th className="px-3 py-2 font-bold text-white">Nombre de Asignatura</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5 text-slate-300">
+                          {filteredPreviewAsignaturas.slice(0, 100).map((asig, idx) => (
+                            <tr key={asig.id} className="hover:bg-white/[0.02]">
+                              <td className="px-3 py-1.5 font-mono text-slate-500 text-[11px]">
+                                {idx + 1}
+                              </td>
+                              <td className="px-3 py-1.5 font-mono font-semibold text-cyan-300 text-[11px]">
+                                {asig.cleanClave}
+                              </td>
+                              <td className="px-3 py-1.5 font-mono text-slate-400 text-[11px]">
+                                {asig.clave || "—"}
+                              </td>
+                              <td className="px-3 py-1.5 font-medium text-white">
+                                {asig.nombre}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-xs text-slate-400">
+                      Las siguientes claves existen en tu archivo pero no se encontraron en la base de datos de asignaturas:
+                    </p>
+                    <div className="flex flex-wrap gap-1.5 max-h-48 overflow-y-auto p-2 rounded-lg bg-slate-900/60 border border-white/5">
+                      {unmatchedClaves.map((key) => (
+                        <span
+                          key={key}
+                          className="rounded-lg bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 text-[11px] font-mono text-amber-300"
+                        >
+                          {key}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── PASO 2: CARGA DE PERFILES DOCENTES (PROFESORES) ── */}
       <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6 backdrop-blur-sm shadow-xl space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5">
           <div className="flex items-center gap-3">
@@ -410,9 +939,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               <Users className="h-5 w-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white tracking-tight">
-                Carga de Perfiles Docentes (Profesores)
-              </h2>
+              <div className="flex items-center gap-2">
+                <span className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-indigo-300">
+                  Paso 2
+                </span>
+                <h2 className="text-base font-bold text-white tracking-tight">
+                  Carga de Perfiles Docentes (Profesores)
+                </h2>
+              </div>
               <p className="text-xs text-slate-400">
                 Sube el archivo <code className="text-indigo-300">.xlsx</code> o <code className="text-indigo-300">.csv</code> con la información académica y laboral
               </p>
@@ -535,7 +1069,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         )}
       </div>
 
-      {/* ── SECCIÓN 2: CONSTRUCTOR DINÁMICO DE QUERIES Y PONDERACIÓN ── */}
+      {/* ── PASO 3: CONSTRUCTOR DINÁMICO DE QUERIES Y PONDERACIÓN ── */}
       {file && queryConfigs.length > 0 && (
         <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6 backdrop-blur-sm shadow-xl space-y-6">
           <div className="flex items-center justify-between border-b border-white/10 pb-5">
@@ -544,10 +1078,15 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <Sliders className="h-5 w-5" />
               </div>
               <div>
-                <h3 className="text-base font-bold text-white tracking-tight">
-                  Constructor Dinámico de Queries y Ponderación
-                </h3>
-                <p className="text-xs text-slate-400">
+                <div className="flex items-center gap-2">
+                  <span className="rounded-md bg-purple-500/20 border border-purple-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-purple-300">
+                    Paso 3
+                  </span>
+                  <h3 className="text-base font-bold text-white tracking-tight">
+                    Constructor Dinámico de Queries y Ponderación
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-400 mt-0.5">
                   Selecciona qué campos del docente ponderar, edita sus plantillas asimétricas y asigna pesos ($w_i$)
                 </p>
               </div>
@@ -659,11 +1198,15 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <span className="rounded-lg bg-purple-500/15 border border-purple-500/30 px-2.5 py-1 text-[11px] font-medium text-purple-300 flex items-center gap-1">
                   <span>🎯 match_nombre=True no consume cupo</span>
                 </span>
-                {totalCatalogCount > 0 && (
+                {isFilterEffective ? (
+                  <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 text-[11px] font-mono text-emerald-300 flex items-center gap-1 font-semibold">
+                    <span>⚡ Filtro activo: {filteredAsignaturas.length} asignaturas (de {totalCatalogCount})</span>
+                  </span>
+                ) : totalCatalogCount > 0 ? (
                   <span className="rounded-lg bg-indigo-500/15 border border-indigo-500/30 px-2.5 py-1 text-[11px] font-mono text-indigo-300">
                     Total en catálogo: {totalCatalogCount} asignaturas
                   </span>
-                )}
+                ) : null}
               </div>
             </div>
 
@@ -798,11 +1341,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                       <input
                         type="number"
                         min="1"
-                        max={totalCatalogCount > 0 ? totalCatalogCount : 500}
+                        max={effectiveCatalogCount > 0 ? effectiveCatalogCount : 500}
                         value={topK}
                         onChange={(e) => {
                           const val = parseInt(e.target.value, 10);
-                          const maxLimit = totalCatalogCount > 0 ? totalCatalogCount : 500;
+                          const maxLimit = effectiveCatalogCount > 0 ? effectiveCatalogCount : 500;
                           if (!isNaN(val)) {
                             setTopK(Math.min(maxLimit, Math.max(1, val)));
                           }
@@ -810,7 +1353,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         className="w-16 rounded-lg border border-white/15 bg-slate-900 px-2 py-1 text-xs font-mono font-bold text-center text-indigo-300 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                       />
                       <span className="text-[11px] text-slate-400 font-mono">
-                        / {totalCatalogCount > 0 ? totalCatalogCount : "máx"}
+                        / {effectiveCatalogCount > 0 ? effectiveCatalogCount : "máx"}
                       </span>
                     </div>
                   </div>
@@ -818,7 +1361,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   <input
                     type="range"
                     min="1"
-                    max={totalCatalogCount > 0 ? totalCatalogCount : 50}
+                    max={effectiveCatalogCount > 0 ? effectiveCatalogCount : 50}
                     step="1"
                     value={topK}
                     onChange={(e) => setTopK(parseInt(e.target.value, 10))}
@@ -827,32 +1370,34 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
                   {/* Botones de selección rápida para Top K */}
                   <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                    {[1, 2, 3, 5, 10].map((k) => (
+                    {[1, 2, 3, 5, 10]
+                      .filter((k) => effectiveCatalogCount === 0 || k <= effectiveCatalogCount)
+                      .map((k) => (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => setTopK(k)}
+                          className={`rounded-lg px-2.5 py-0.5 text-[10px] font-mono transition ${
+                            topK === k
+                              ? "bg-indigo-600 text-white font-bold"
+                              : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
+                          }`}
+                        >
+                          Top {k}
+                        </button>
+                      ))}
+                    {effectiveCatalogCount > 0 && (
                       <button
-                        key={k}
                         type="button"
-                        onClick={() => setTopK(k)}
+                        onClick={() => setTopK(effectiveCatalogCount)}
                         className={`rounded-lg px-2.5 py-0.5 text-[10px] font-mono transition ${
-                          topK === k
-                            ? "bg-indigo-600 text-white font-bold"
-                            : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
-                        }`}
-                      >
-                        Top {k}
-                      </button>
-                    ))}
-                    {totalCatalogCount > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setTopK(totalCatalogCount)}
-                        className={`rounded-lg px-2.5 py-0.5 text-[10px] font-mono transition ${
-                          topK === totalCatalogCount
+                          topK === effectiveCatalogCount
                             ? "bg-purple-600 text-white font-bold"
                             : "bg-purple-500/10 text-purple-300 border border-purple-500/30 hover:bg-purple-500/20"
                         }`}
-                        title="Seleccionar todas las asignaturas disponibles en el catálogo"
+                        title="Seleccionar todas las asignaturas disponibles en el conjunto activo"
                       >
-                        Todas ({totalCatalogCount})
+                        Todas ({effectiveCatalogCount})
                       </button>
                     )}
                   </div>
@@ -864,7 +1409,18 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           {/* Botón de Ejecución Principal */}
           <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-5">
             <p className="text-xs text-slate-400 max-w-md">
-              Genera los embeddings multimodales con Gemini 2 para cada docente y consulta la función RPC <code className="font-mono text-indigo-300">match_asignaturas_cosine</code> en Supabase.
+              {isFilterEffective ? (
+                <>
+                  Genera embeddings multimodales con Gemini 2 y corre la matriz de distancias{" "}
+                  <strong className="text-emerald-300 font-semibold">
+                    exclusivamente en las {filteredAsignaturas.length} asignaturas filtradas
+                  </strong>.
+                </>
+              ) : (
+                <>
+                  Genera los embeddings multimodales con Gemini 2 para cada docente y consulta la función RPC <code className="font-mono text-indigo-300">match_asignaturas_cosine</code> en Supabase sobre el catálogo completo.
+                </>
+              )}
             </p>
 
             <button
@@ -881,7 +1437,10 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               ) : (
                 <>
                   <Sparkles className="h-4 w-4" />
-                  <span>Ejecutar Matching Inteligente</span>
+                  <span>
+                    Ejecutar Matching Inteligente{" "}
+                    {isFilterEffective ? `(${filteredAsignaturas.length} Filtradas)` : "(Catálogo Completo)"}
+                  </span>
                 </>
               )}
             </button>
@@ -905,27 +1464,38 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         </div>
       )}
 
-      {/* ── SECCIÓN 3: RESULTADOS DEL MATCHING Y EXPORTACIÓN ── */}
+      {/* ── PASO 4: RESULTADOS DEL MATCHING Y EXPORTACIÓN ── */}
       {matchResults.length > 0 && (
         <div className="rounded-2xl border border-white/10 bg-slate-900/60 p-6 backdrop-blur-sm shadow-xl space-y-6">
           {/* Header de Resultados y KPIs */}
           <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5">
             <div>
               <div className="flex items-center gap-2">
+                <span className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-indigo-300">
+                  Paso 4 &bull; Resultados
+                </span>
                 <Award className="h-5 w-5 text-indigo-400" />
                 <h3 className="text-base font-bold text-white tracking-tight">
                   Resultados del Matching de Profesores
                 </h3>
               </div>
-              <p className="text-xs text-slate-400">
-                {matchResults.length} docentes evaluados &bull;{" "}
-                <span className="text-indigo-300 font-semibold">
-                  {filterMode === "threshold"
-                    ? `Modo Umbral: todas las asignaturas con similitud ≥ ${(threshold * 100).toFixed(0)}% (ordenadas de mayor a menor)`
-                    : filterMode === "topK"
-                    ? `Modo Top K: ${topK} asignaturas por profesor (ordenadas de mayor a menor)`
-                    : `Modo Combinado: hasta ${topK} asignaturas con similitud ≥ ${(threshold * 100).toFixed(0)}% (ordenadas de mayor a menor)`}
+              <p className="text-xs text-slate-400 mt-1 flex flex-wrap items-center gap-2">
+                <span>
+                  {matchResults.length} docentes evaluados &bull;{" "}
+                  <span className="text-indigo-300 font-semibold">
+                    {filterMode === "threshold"
+                      ? `Modo Umbral: similitud ≥ ${(threshold * 100).toFixed(0)}%`
+                      : filterMode === "topK"
+                      ? `Modo Top K: ${topK} asignaturas`
+                      : `Modo Combinado: hasta ${topK} con similitud ≥ ${(threshold * 100).toFixed(0)}%`}
+                  </span>
                 </span>
+                {isFilterEffective && (
+                  <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-mono text-emerald-300 font-semibold">
+                    <CheckCircle2 className="h-3 w-3 text-emerald-400" />
+                    Filtrado a {filteredAsignaturas.length} asignaturas
+                  </span>
+                )}
               </p>
             </div>
 

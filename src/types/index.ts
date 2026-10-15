@@ -80,3 +80,23 @@ export interface EmbeddingBatchResponse {
   error?: string;
   tokensUsed?: number;
 }
+
+export interface FilteredAsignatura {
+  id: number;
+  clave: string | null;
+  cleanClave: string;
+  nombre: string;
+  contenido_tematico?: string | null;
+  match_nombre?: boolean;
+  hasEmbedding?: boolean;
+}
+
+export interface FilterClavesResponse {
+  success: boolean;
+  matchedAsignaturas: FilteredAsignatura[];
+  matchedIds: number[];
+  matchedCount: number;
+  unmatchedClaves: string[];
+  totalUploadedClaves: number;
+  error?: string;
+}

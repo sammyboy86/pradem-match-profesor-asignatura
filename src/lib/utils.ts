@@ -131,6 +131,21 @@ export async function parseSpreadsheetFile(
 }
 
 /**
+ * Limpieza preliminar de clave de asignatura:
+ * Quita cualquier carácter no alfa-numérico y pasa todo a mayúsculas.
+ * Ej: "ING-101\n" -> "ING101", "mat_202" -> "MAT202"
+ */
+export function cleanClave(raw: unknown): string {
+  if (raw === null || raw === undefined) return "";
+  return String(raw)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remover acentos y diacríticos
+    .replace(/[^a-zA-Z0-9]/g, "") // quitar todo carácter no alfa-numérico
+    .toUpperCase()
+    .trim();
+}
+
+/**
  * Genera el texto estructurado para el embedding multimodal de una asignatura
  */
 export function formatAsignaturaForEmbedding(item: Partial<Asignatura>): string {
