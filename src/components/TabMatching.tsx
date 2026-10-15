@@ -19,6 +19,7 @@ import {
   Filter,
   BarChart3,
   Percent,
+  UserCheck,
 } from "lucide-react";
 import {
   Profesor,
@@ -1102,20 +1103,81 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     {/* Contenido Expandido: K Asignaturas Recomendadas */}
                     {isExpanded && (
                       <div className="border-t border-white/10 bg-slate-900/40 p-4 space-y-3">
-                        {/* Resumen de Datos del Profesor */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs bg-slate-950/60 p-3 rounded-lg border border-white/5">
-                          {queryConfigs
-                            .filter((c) => c.active && result.profesor[c.field])
-                            .map((c) => (
-                              <div key={c.field} className="space-y-0.5">
-                                <span className="text-[10px] uppercase font-bold text-slate-400">
-                                  {c.label}:
+                        {/* Datos Completos del Profesor (Campos Elegidos para el Matching) */}
+                        <div className="space-y-2.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                              <UserCheck className="h-3.5 w-3.5 text-indigo-400" />
+                              Campos Evaluados del Docente (Texto Completo):
+                            </span>
+                            <span className="text-[10px] text-slate-400">
+                              Información completa sin truncar
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {queryConfigs
+                              .filter((c) => c.active && result.profesor[c.field])
+                              .map((c) => {
+                                const normalizedPercent =
+                                  totalActiveWeight > 0
+                                    ? ((c.weight / totalActiveWeight) * 100).toFixed(0)
+                                    : "0";
+
+                                return (
+                                  <div
+                                    key={c.field}
+                                    className="rounded-xl border border-white/10 bg-slate-950/80 p-3.5 space-y-2 shadow-sm"
+                                  >
+                                    <div className="flex items-center justify-between border-b border-white/5 pb-1.5">
+                                      <span className="text-[11px] font-bold uppercase tracking-wide text-indigo-300">
+                                        {c.label}
+                                      </span>
+                                      <span className="rounded bg-indigo-500/20 text-indigo-300 text-[10px] px-2 py-0.5 font-mono font-semibold">
+                                        Influencia: {normalizedPercent}%
+                                      </span>
+                                    </div>
+                                    <div className="text-slate-200 text-xs leading-relaxed whitespace-pre-wrap break-words">
+                                      {String(result.profesor[c.field])}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                          </div>
+
+                          {/* Otros campos del archivo si existen y no fueron usados en matching */}
+                          {fileHeaders.filter(
+                            (h) =>
+                              h !== nameColumn &&
+                              !queryConfigs.some((c) => c.active && c.field === h) &&
+                              result.profesor[h]
+                          ).length > 0 && (
+                            <details className="text-xs group pt-1">
+                              <summary className="text-[11px] text-slate-400 cursor-pointer hover:text-slate-200 transition select-none flex items-center gap-1">
+                                <span className="underline">Ver otros datos del docente</span>
+                                <span className="text-[10px] text-slate-500">
+                                  ({fileHeaders.filter((h) => h !== nameColumn && !queryConfigs.some((c) => c.active && c.field === h) && result.profesor[h]).length} campos no incluidos en matching)
                                 </span>
-                                <p className="text-slate-300 text-xs line-clamp-2">
-                                  {String(result.profesor[c.field])}
-                                </p>
+                              </summary>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 mt-2 bg-slate-950/40 p-3 rounded-xl border border-white/5">
+                                {fileHeaders
+                                  .filter(
+                                    (h) =>
+                                      h !== nameColumn &&
+                                      !queryConfigs.some((c) => c.active && c.field === h) &&
+                                      result.profesor[h]
+                                  )
+                                  .map((h) => (
+                                    <div key={h} className="text-xs space-y-0.5">
+                                      <span className="text-[10px] uppercase font-bold text-slate-400">{h}:</span>
+                                      <div className="text-slate-300 whitespace-pre-wrap break-words">
+                                        {String(result.profesor[h])}
+                                      </div>
+                                    </div>
+                                  ))}
                               </div>
-                            ))}
+                            </details>
+                          )}
                         </div>
 
                         {/* Tarjetas de Asignaturas Recomendadas */}
@@ -1186,10 +1248,10 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
                                   {/* Extracto de Contenido Temático */}
                                   {matchItem.contenido_tematico && (
-                                    <p className="text-[11px] text-slate-400 bg-white/[0.02] p-2 rounded border border-white/5 line-clamp-2">
-                                      <span className="font-semibold text-slate-300">Temario: </span>
+                                    <div className="text-[11px] text-slate-300 bg-white/[0.02] p-2.5 rounded-lg border border-white/5 whitespace-pre-wrap break-words leading-relaxed max-h-60 overflow-y-auto">
+                                      <span className="font-semibold text-slate-200">Temario: </span>
                                       {matchItem.contenido_tematico}
-                                    </p>
+                                    </div>
                                   )}
                                 </div>
                               );
