@@ -1,436 +1,111 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
-import PrademLogo from "@/components/PrademLogo";
-import Step1ConnectionStatus from "@/components/Step1ConnectionStatus";
-import Step2EmbeddingConfig from "@/components/Step2EmbeddingConfig";
-import Step3GenerateAction from "@/components/Step3GenerateAction";
-import Step4RecordsTable from "@/components/Step4RecordsTable";
-import { Sparkles, Database, CheckCircle2, Clock } from "lucide-react";
+import React, { useState, useEffect } from "react";
+import HeaderNav from "@/components/HeaderNav";
+import TabAsignaturas from "@/components/TabAsignaturas";
+import TabMatching from "@/components/TabMatching";
+import ApiKeyModal from "@/components/ApiKeyModal";
+import SqlSetupModal from "@/components/SqlSetupModal";
+import { apiFetch } from "@/lib/utils";
 
-// Obtener el prefijo base de las rutas (soporta tanto /admin-embed-asignatura como /embed-asignatura)
-const getBasePath = (): string => {
-  if (typeof window !== "undefined") {
-    if (window.location.pathname.startsWith("/admin-embed-asignatura")) {
-      return "/admin-embed-asignatura";
-    }
-    if (window.location.pathname.startsWith("/embed-asignatura")) {
-      return "/embed-asignatura";
-    }
-  }
-  return process.env.NEXT_PUBLIC_BASE_PATH || "/admin-embed-asignatura";
-};
+export default function HomePage() {
+  const [activeTab, setActiveTab] = useState<"asignaturas" | "matching">("asignaturas");
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
+  const [isSqlModalOpen, setIsSqlModalOpen] = useState(false);
+  const [customApiKey, setCustomApiKey] = useState("");
+  const [tableExists, setTableExists] = useState<boolean | null>(null);
 
-// Cliente fetch seguro que valida el tipo de contenido antes de parsear JSON
-async function safeFetchJson<T = any>(endpoint: string, init?: RequestInit): Promise<T> {
-  const basePath = getBasePath();
-  const url = `${basePath}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
-  const res = await fetch(url, init);
-
-  const contentType = res.headers.get("content-type") || "";
-  if (!contentType.includes("application/json")) {
-    const text = await res.text();
-    const snippet = text.slice(0, 100).replace(/\s+/g, " ");
-    throw new Error(
-      `El servidor respondió con ${res.status} (${res.statusText || "No OK"}) en '${url}', pero no devolvió JSON: "${snippet}"`
-    );
-  }
-
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}: Error en la respuesta del servidor`);
-  }
-  return data;
-}
-
-export default function EmbedAsignaturaPage() {
-  // ── Estados de columnas y datos ──
-  const [columns, setColumns] = useState<Array<{ name: string; type: string }>>([]);
-  const [sourceColumn, setSourceColumn] = useState<string>("nombre");
-  const [targetColumn, setTargetColumn] = useState<string>("embedding");
-  const [mode, setMode] = useState<"missing_only" | "all">("missing_only");
-  const [records, setRecords] = useState<Array<Record<string, unknown>>>([]);
-
-  // ── Estados de Diagnóstico y Métricas ──
-  const [loadingInitial, setLoadingInitial] = useState<boolean>(true);
-  const [loadingRecords, setLoadingRecords] = useState<boolean>(false);
-  const [tableExists, setTableExists] = useState<boolean>(true);
-  const [totalRecords, setTotalRecords] = useState<number>(0);
-  const [withEmbeddingCount, setWithEmbeddingCount] = useState<number>(0);
-  const [withoutEmbeddingCount, setWithoutEmbeddingCount] = useState<number>(0);
-
-  // ── Clave Jina AI (Almacenada en memoria y sincronizada con localStorage) ──
-  const [jinaApiKey, setJinaApiKey] = useState<string>("");
-
-  // ── Estados de Generación ──
-  const [isGenerating, setIsGenerating] = useState<boolean>(false);
-  const [progressPercentage, setProgressPercentage] = useState<number>(0);
-  const [statusMessage, setStatusMessage] = useState<string>("");
-  const [logs, setLogs] = useState<string[]>([]);
-  const [lastResult, setLastResult] = useState<{
-    success: boolean;
-    totalUpdated: number;
-    tokensUsed: number;
-    durationSeconds: number;
-    message: string;
-    errors?: string[];
-  } | null>(null);
-
-  // Cargar Jina API Key desde localStorage si existe
+  // Cargar clave personalizada desde localStorage
   useEffect(() => {
     try {
-      const savedKey = localStorage.getItem("pradem_jina_api_key");
-      if (savedKey) {
-        setJinaApiKey(savedKey);
+      const storedKey = localStorage.getItem("gemini_api_key");
+      if (storedKey) {
+        setCustomApiKey(storedKey);
       }
     } catch {
-      // Ignorar en entornos sin acceso a localStorage
+      // Ignorar en SSR
     }
   }, []);
 
-  const handleApiKeyChange = (newKey: string) => {
-    setJinaApiKey(newKey);
+  // Verificar estado de la base de datos Supabase
+  const checkDatabaseStatus = async () => {
     try {
-      if (newKey) {
-        localStorage.setItem("pradem_jina_api_key", newKey);
+      const data = await apiFetch<{
+        success: boolean;
+        tableExists: boolean;
+      }>("/api/asignaturas?limit=1");
+      setTableExists(data.tableExists !== false);
+    } catch {
+      setTableExists(false);
+    }
+  };
+
+  useEffect(() => {
+    checkDatabaseStatus();
+  }, []);
+
+  const handleSaveApiKey = (key: string) => {
+    setCustomApiKey(key);
+    try {
+      if (key) {
+        localStorage.setItem("gemini_api_key", key);
       } else {
-        localStorage.removeItem("pradem_jina_api_key");
+        localStorage.removeItem("gemini_api_key");
       }
     } catch {
       // Ignorar
     }
   };
 
-  const addLog = useCallback((message: string) => {
-    const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [`[${time}] ${message}`, ...prev]);
-  }, []);
-
-  // ── Cargar Columnas ──
-  const loadColumns = useCallback(async () => {
-    try {
-      const data = await safeFetchJson<{
-        success: boolean;
-        columns?: Array<{ name: string; type: string }>;
-        tableExists?: boolean;
-        error?: string;
-      }>("/api/table-columns");
-
-      if (data.success && Array.isArray(data.columns)) {
-        setColumns(data.columns);
-        setTableExists(true);
-
-        // Si 'nombre' existe, seleccionarlo por defecto como origen
-        const hasNombre = data.columns.some((c: { name: string }) => c.name === "nombre");
-        if (hasNombre) {
-          setSourceColumn("nombre");
-        } else if (data.columns.length > 0) {
-          const firstEligible = data.columns.find(
-            (c: { name: string }) => !["id", "created_at"].includes(c.name.toLowerCase())
-          );
-          if (firstEligible) setSourceColumn(firstEligible.name);
-        }
-      } else {
-        if (data.tableExists === false) {
-          setTableExists(false);
-        }
-      }
-    } catch (err) {
-      console.error("Error al cargar columnas:", err);
-    }
-  }, []);
-
-  // ── Cargar Registros y Métricas ──
-  const loadRecords = useCallback(async (targetCol: string = targetColumn) => {
-    setLoadingRecords(true);
-    try {
-      const data = await safeFetchJson<{
-        success: boolean;
-        records?: Array<Record<string, unknown>>;
-        totalCount?: number;
-        countWithEmbedding?: number;
-        countWithoutEmbedding?: number;
-        error?: string;
-      }>(
-        `/api/table-records?limit=50&targetColumn=${encodeURIComponent(targetCol)}`
-      );
-
-      if (data.success) {
-        setRecords(data.records || []);
-        setTotalRecords(data.totalCount || 0);
-        setWithEmbeddingCount(data.countWithEmbedding || 0);
-        setWithoutEmbeddingCount(data.countWithoutEmbedding || 0);
-      }
-    } catch (err) {
-      console.error("Error al cargar registros:", err);
-    } finally {
-      setLoadingRecords(false);
-      setLoadingInitial(false);
-    }
-  }, [targetColumn]);
-
-  // Carga inicial
-  useEffect(() => {
-    loadColumns();
-    loadRecords();
-  }, [loadColumns, loadRecords]);
-
-  // Recargar métricas cuando cambie la columna destino
-  useEffect(() => {
-    if (targetColumn.trim()) {
-      loadRecords(targetColumn.trim());
-    }
-  }, [targetColumn, loadRecords]);
-
-  // ── Ejecutar Generación de Embeddings ──
-  const handleGenerateEmbeddings = async () => {
-    if (!sourceColumn || !targetColumn) return;
-
-    setIsGenerating(true);
-    setProgressPercentage(10);
-    setStatusMessage("Verificando columna destino en asignaturas_extraidas...");
-    setLastResult(null);
-
-    addLog(`Iniciando generación de embeddings desde '${sourceColumn}' hacia '${targetColumn}'...`);
-
-    try {
-      // 1. Asegurar columna destino
-      addLog(`Comprobando existencia de columna '${targetColumn}' en Supabase...`);
-      const ensureData = await safeFetchJson<{
-        success: boolean;
-        created?: boolean;
-        exists?: boolean;
-        column?: string;
-        message?: string;
-        error?: string;
-      }>("/api/ensure-column", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          columnName: targetColumn,
-          columnType: "jsonb",
-        }),
-      });
-
-      if (ensureData.created) {
-        addLog(`Columna '${targetColumn}' creada exitosamente en Supabase.`);
-      } else {
-        addLog(`Columna '${targetColumn}' validada en Supabase.`);
-      }
-
-      setProgressPercentage(30);
-      setStatusMessage("Conectando con Jina AI y procesando asignaturas...");
-
-      // 2. Invocar API de generación
-      addLog("Llamando a Jina AI API (jina-embeddings-v2-base-es)...");
-      const genData = await safeFetchJson<{
-        success: boolean;
-        totalUpdated: number;
-        tokensUsed: number;
-        durationSeconds: number;
-        message: string;
-        errors?: string[];
-        error?: string;
-      }>("/api/generate-embeddings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sourceColumn,
-          targetColumn,
-          apiKey: jinaApiKey,
-          model: "jina-embeddings-v2-base-es",
-          mode,
-          batchSize: 25,
-        }),
-      });
-
-      if (!genData.success) {
-        throw new Error(genData.error || "Error al procesar los embeddings.");
-      }
-
-      setProgressPercentage(100);
-      setStatusMessage("¡Proceso completado exitosamente!");
-      addLog(
-        `Completado: ${genData.totalUpdated} asignaturas actualizadas. Tokens consumidos: ${
-          genData.tokensUsed || 0
-        }`
-      );
-
-      setLastResult({
-        success: true,
-        totalUpdated: genData.totalUpdated,
-        tokensUsed: genData.tokensUsed,
-        durationSeconds: genData.durationSeconds,
-        message: genData.message,
-        errors: genData.errors,
-      });
-
-      // Refrescar registros y columnas
-      await loadColumns();
-      await loadRecords(targetColumn);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Error inesperado durante la generación";
-      addLog(`ERROR: ${msg}`);
-      setStatusMessage("Hubo un error en la ejecución.");
-      setLastResult({
-        success: false,
-        totalUpdated: 0,
-        tokensUsed: 0,
-        durationSeconds: 0,
-        message: msg,
-      });
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
-  // Valor de muestra de la columna origen
-  const sampleValue =
-    records.length > 0 && records[0][sourceColumn]
-      ? String(records[0][sourceColumn])
-      : undefined;
-
-  // Verificar si la columna destino existe
-  const existingTargetColumn = columns.some(
-    (c) => c.name.toLowerCase() === targetColumn.trim().toLowerCase()
-  );
-
   return (
-    <main className="min-h-screen pb-16">
-      {/* ── Header Pradem Satélite ── */}
-      <header className="border-b border-white/10 bg-slate-950/70 backdrop-blur-md sticky top-0 z-40">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-6 py-4">
-          <div className="flex items-center gap-4">
-            <a
-              href="/dashboard"
-              className="relative flex-shrink-0 transition hover:opacity-80"
-              title="Volver al Dashboard"
-            >
-              <PrademLogo className="h-9 w-9 text-[#C8A2C8]" />
-              <span className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-indigo-500/40 text-[11px] ring-2 ring-slate-950">
-                ⚡
-              </span>
-            </a>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-bold text-white tracking-tight">
-                  06 Generador de Embeddings de Asignatura
-                </h1>
-                <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-[10px] font-semibold text-indigo-300 border border-indigo-500/30">
-                  Satélite Pradem
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Generación de vectores densos con Jina AI e inserción en{" "}
-                <code className="text-amber-300 font-mono">asignaturas_extraidas</code>
-              </p>
-            </div>
-          </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-indigo-500/30">
+      {/* Barra de Navegación Superior */}
+      <HeaderNav
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        onOpenApiKeyModal={() => setIsApiKeyModalOpen(true)}
+        onOpenSqlModal={() => setIsSqlModalOpen(true)}
+        hasCustomKey={Boolean(customApiKey && customApiKey.length > 0)}
+        tableExists={tableExists}
+      />
 
-          <a
-            href="/dashboard"
-            className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 transition hover:bg-white/10 hover:text-white"
-            title="Volver a Herramientas de Pradem"
-          >
-            <span>←</span> Herramientas
-          </a>
+      {/* Contenido Principal con Contenedor Responsivo */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
+        {activeTab === "asignaturas" ? (
+          <TabAsignaturas
+            onDatabaseUpdated={checkDatabaseStatus}
+            onOpenSqlModal={() => setIsSqlModalOpen(true)}
+          />
+        ) : (
+          <TabMatching onOpenSqlModal={() => setIsSqlModalOpen(true)} />
+        )}
+      </main>
+
+      {/* Footer Minimalista */}
+      <footer className="border-t border-white/10 bg-slate-950/80 py-6 text-center text-xs text-slate-500">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+          <span>
+            Pradem Match Profesor – Asignatura &copy; {new Date().getFullYear()}
+          </span>
+          <span className="font-mono text-[11px] text-slate-400">
+            Google GenAI gemini-embedding-2 &bull; Supabase pgvector HNSW
+          </span>
         </div>
-      </header>
+      </footer>
 
-      {/* ── Contenido Principal ── */}
-      <div className="mx-auto max-w-5xl px-6 py-8 space-y-8">
-        {/* ── Barra Superior de Resumen y Estado ── */}
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.02] px-5 py-3.5 backdrop-blur-sm">
-          <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-xs">
-            <div className="flex items-center gap-2">
-              <Database className="h-4 w-4 text-indigo-400" />
-              <span className="text-slate-400">Total en BD:</span>
-              <span className="font-mono font-semibold text-white">
-                {loadingInitial ? "..." : totalRecords}
-              </span>
-            </div>
+      {/* Modales Auxiliares */}
+      <ApiKeyModal
+        isOpen={isApiKeyModalOpen}
+        onClose={() => setIsApiKeyModalOpen(false)}
+        onSaveKey={handleSaveApiKey}
+        initialKey={customApiKey}
+      />
 
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-              <span className="text-slate-400">Con Embeddings:</span>
-              <span className="font-mono font-semibold text-emerald-400">
-                {loadingInitial ? "..." : withEmbeddingCount}
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Clock className="h-4 w-4 text-amber-400" />
-              <span className="text-slate-400">Pendientes:</span>
-              <span className="font-mono font-semibold text-amber-300">
-                {loadingInitial ? "..." : withoutEmbeddingCount}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 text-xs">
-            <span className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-[11px] font-mono text-indigo-300">
-              <Sparkles className="h-3 w-3 text-indigo-400" />
-              jina-embeddings-v2-base-es (768d)
-            </span>
-          </div>
-        </div>
-
-        {/* ── Flujo Guiado en 4 Pasos ── */}
-        <div className="space-y-8">
-          {/* Paso 1: Diagnóstico de Conexión y API Key */}
-          <Step1ConnectionStatus
-            loading={loadingRecords || loadingInitial}
-            totalRecords={totalRecords}
-            withEmbeddingCount={withEmbeddingCount}
-            withoutEmbeddingCount={withoutEmbeddingCount}
-            targetColumnName={targetColumn}
-            tableExists={tableExists}
-            jinaApiKey={jinaApiKey}
-            onApiKeyChange={handleApiKeyChange}
-            onRefreshStats={() => {
-              loadColumns();
-              loadRecords();
-            }}
-          />
-
-          {/* Paso 2: Configuración de Columnas y Modelo */}
-          <Step2EmbeddingConfig
-            columns={columns}
-            sourceColumn={sourceColumn}
-            onSourceColumnChange={setSourceColumn}
-            targetColumn={targetColumn}
-            onTargetColumnChange={setTargetColumn}
-            mode={mode}
-            onModeChange={setMode}
-            sampleValue={sampleValue}
-            existingTargetColumn={existingTargetColumn}
-          />
-
-          {/* Paso 3: Botón de Acción Principal y Progreso */}
-          <Step3GenerateAction
-            isGenerating={isGenerating}
-            onGenerate={handleGenerateEmbeddings}
-            sourceColumn={sourceColumn}
-            targetColumn={targetColumn}
-            hasApiKey={Boolean(jinaApiKey && jinaApiKey.trim().length > 0)}
-            tableExists={tableExists}
-            progressPercentage={progressPercentage}
-            statusMessage={statusMessage}
-            logs={logs}
-            lastResult={lastResult}
-          />
-
-          {/* Paso 4: Visor de Registros y Auditoría */}
-          <Step4RecordsTable
-            records={records as any}
-            loading={loadingRecords}
-            totalRecords={totalRecords}
-            sourceColumn={sourceColumn}
-            targetColumn={targetColumn}
-            onRefresh={() => loadRecords(targetColumn)}
-          />
-        </div>
-      </div>
-    </main>
+      <SqlSetupModal
+        isOpen={isSqlModalOpen}
+        onClose={() => setIsSqlModalOpen(false)}
+        tableExists={tableExists}
+      />
+    </div>
   );
 }

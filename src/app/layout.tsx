@@ -13,15 +13,11 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "06 Generador de Embeddings de Asignatura | Pradem",
+  title: "Match Profesor – Asignatura | Pradem",
   description:
-    "Herramienta satélite de Pradem para generar embeddings vectoriales de asignaturas con Jina AI e insertarlos en Supabase.",
+    "Gestión de programas de estudio y asignación inteligente de profesores mediante embeddings multimodales con gemini-embedding-2 y Supabase pgvector.",
 };
 
-/**
- * Layout raíz de 06embedAsignatura.
- * Herramienta satélite de Pradem Core.
- */
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -32,7 +28,7 @@ export default function RootLayout({
       lang="es"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full font-sans bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 text-white">
+      <body className="min-h-full font-sans bg-slate-950 text-slate-100">
         {children}
       </body>
     </html>
