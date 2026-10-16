@@ -80,8 +80,9 @@ export async function parseSpreadsheetFile(
       Papa.parse(file, {
         header: true,
         skipEmptyLines: "greedy",
+        transformHeader: (header) => header.replace(/^\uFEFF/, "").trim(),
         complete: (results) => {
-          const headers = results.meta.fields || [];
+          const headers = (results.meta.fields || []).map((h) => h.replace(/^\uFEFF/, "").trim());
           const rows = (results.data as Record<string, string>[]).filter((row) =>
             Object.values(row).some((val) => val && String(val).trim().length > 0)
           );
@@ -110,10 +111,10 @@ export async function parseSpreadsheetFile(
             return;
           }
 
-          const headers = Object.keys(json[0]);
+          const headers = Object.keys(json[0]).map((h) => h.trim());
           const stringRows = json.map((r) =>
             Object.fromEntries(
-              Object.entries(r).map(([k, v]) => [k, v != null ? String(v).trim() : ""])
+              Object.entries(r).map(([k, v]) => [k.trim(), v != null ? String(v).trim() : ""])
             )
           );
 
@@ -128,6 +129,70 @@ export async function parseSpreadsheetFile(
   }
 
   throw new Error(`Formato no soportado: .${extension}. Usa archivos .csv, .xlsx o .xls`);
+}
+
+/**
+ * Parsea un valor de celda que contiene un vector de embedding.
+ * Soporta:
+ * - JSON arrays: "[0.123, -0.456, ...]"
+ * - Numpy strings (espacios en vez de comas): "[-0.0123  0.0456  -1.2e-3]"
+ * - Postgres arrays/vectores: "{0.123, -0.456, ...}"
+ * - Listas separadas por comas o espacios: "0.123, -0.456, 0.789"
+ * - Arrays numéricos nativos
+ */
+export function parseEmbeddingValue(val: unknown): number[] | null {
+  if (val === null || val === undefined) return null;
+
+  if (Array.isArray(val)) {
+    const nums = val.map((x) => (typeof x === "number" ? x : parseFloat(String(x))));
+    return nums.length > 0 && nums.every((n) => !isNaN(n)) ? nums : null;
+  }
+
+  if (typeof val === "string") {
+    let s = val.trim();
+    if (!s) return null;
+
+    // Quitar comillas externas si quedaron
+    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+      s = s.slice(1, -1).trim();
+    }
+
+    // Quitar corchetes, llaves o paréntesis externos si existen
+    if (
+      (s.startsWith("[") && s.endsWith("]")) ||
+      (s.startsWith("{") && s.endsWith("}")) ||
+      (s.startsWith("(") && s.endsWith(")"))
+    ) {
+      s = s.slice(1, -1).trim();
+    }
+
+    if (!s) return null;
+
+    // Dividir por comas, espacios o saltos de línea (respetando notación científica)
+    const tokens = s.split(/[\s,]+/);
+    const nums: number[] = [];
+
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i].trim();
+      if (!t) continue;
+      const num = Number(t);
+      if (isNaN(num)) {
+        const f = parseFloat(t);
+        if (isNaN(f)) {
+          return null;
+        }
+        nums.push(f);
+      } else {
+        nums.push(num);
+      }
+    }
+
+    if (nums.length > 0) {
+      return nums;
+    }
+  }
+
+  return null;
 }
 
 /**

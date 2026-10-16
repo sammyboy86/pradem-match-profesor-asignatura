@@ -9,7 +9,10 @@ interface SqlSetupModalProps {
   tableExists: boolean | null;
 }
 
-const SQL_MIGRATION_CODE = `-- 1. Habilitar extensión pgvector
+const SQL_MIGRATION_CODE = `-- Drop the existing function first to allow changing its return type
+DROP FUNCTION IF EXISTS match_asignaturas_cosine(VECTOR, INT, FLOAT);
+
+-- 1. Habilitar extensión pgvector
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 2. Tabla de asignaturas con embedding de 768 dimensiones

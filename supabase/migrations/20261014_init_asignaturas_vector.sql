@@ -4,6 +4,9 @@
 -- Ejecuta este script en el SQL Editor de tu proyecto Supabase para habilitar
 -- la extensión vectorial, la tabla de asignaturas y la función de búsqueda coseno.
 
+-- Drop the existing function first to allow changing its return type
+DROP FUNCTION IF EXISTS match_asignaturas_cosine(VECTOR, INT, FLOAT);
+
 -- 1. Habilitar extensión pgvector
 CREATE EXTENSION IF NOT EXISTS vector;
 

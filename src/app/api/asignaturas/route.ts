@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createDirectServerClient } from "@/lib/supabase/server";
 import { Asignatura } from "@/types";
+import { parseEmbeddingValue } from "@/lib/utils";
 
 export const maxDuration = 60;
 
@@ -117,8 +118,15 @@ export async function POST(req: NextRequest) {
         actividades_de_aprendizaje: a.actividades_de_aprendizaje || null,
       };
 
-      if (a.embedding_768 && Array.isArray(a.embedding_768)) {
-        item.embedding_768 = a.embedding_768;
+      if (a.embedding_768) {
+        if (Array.isArray(a.embedding_768) && a.embedding_768.length > 0) {
+          item.embedding_768 = a.embedding_768;
+        } else if (typeof a.embedding_768 === "string") {
+          const parsed = parseEmbeddingValue(a.embedding_768);
+          if (parsed && parsed.length > 0) {
+            item.embedding_768 = parsed;
+          }
+        }
       }
 
       return item;

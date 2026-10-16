@@ -31,6 +31,8 @@ export interface ColumnMapping {
   fines_de_aprendizaje_o_formacion: string;
   contenido_tematico: string;
   actividades_de_aprendizaje: string;
+  embedding_768: string;
+  [key: string]: string;
 }
 
 export interface Profesor {

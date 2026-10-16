@@ -22,7 +22,7 @@ import {
 import { Asignatura, ColumnMapping } from "@/types";
 import {
   parseSpreadsheetFile,
-  formatAsignaturaForEmbedding,
+  parseEmbeddingValue,
   apiFetch,
 } from "@/lib/utils";
 
@@ -49,10 +49,10 @@ export default function TabAsignaturas({
     fines_de_aprendizaje_o_formacion: "",
     contenido_tematico: "",
     actividades_de_aprendizaje: "",
+    embedding_768: "",
   });
 
   // Opciones de Carga
-  const [generateEmbeddings, setGenerateEmbeddings] = useState(true);
   const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("upsert");
 
   // Progreso de Carga
@@ -83,7 +83,6 @@ export default function TabAsignaturas({
   const [loadingDb, setLoadingDb] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"all" | "with_embedding" | "without_embedding">("all");
-  const [isFixingMissingEmbeddings, setIsFixingMissingEmbeddings] = useState(false);
 
   // ── Cargar Registros de Supabase ──
   const loadDatabaseRecords = useCallback(async () => {
@@ -140,6 +139,19 @@ export default function TabAsignaturas({
     return {
       nombre: findMatch(["nombre", "asignatura", "materia", "unidad", "curso", "title"]),
       clave: findMatch(["clave", "codigo", "code", "id", "cod"]),
+      embedding_768: findMatch([
+        "embedding768",
+        "embedding_768",
+        "embeddings",
+        "embedding",
+        "vector768",
+        "vector_768",
+        "vector",
+        "vectores",
+        "emb",
+        "representation",
+        "representacion",
+      ]),
       fines_de_aprendizaje_o_formacion: findMatch([
         "fines",
         "objetivo",
@@ -198,20 +210,32 @@ export default function TabAsignaturas({
     }
 
     setIsUploading(true);
-    setUploadProgress(5);
+    setUploadProgress(10);
     setStatusMessage("Preparando asignaturas para inserción...");
     setUploadReport(null);
 
     try {
-      // Filtrar filas válidas que tengan nombre
+      // Filtrar filas válidas que tengan nombre y extraer embeddings si fueron mapeados
       const validRows: Asignatura[] = [];
       const discardedRows: string[] = [];
+      let parsedEmbeddingsCount = 0;
+      let invalidEmbeddingsCount = 0;
 
       fileRows.forEach((row, idx) => {
         const nombreVal = mapping.nombre ? row[mapping.nombre]?.trim() : "";
         if (!nombreVal) {
           discardedRows.push(`Fila ${idx + 1}: Sin nombre de asignatura`);
           return;
+        }
+
+        let parsedEmb: number[] | null = null;
+        if (mapping.embedding_768 && row[mapping.embedding_768]) {
+          parsedEmb = parseEmbeddingValue(row[mapping.embedding_768]);
+          if (parsedEmb) {
+            parsedEmbeddingsCount++;
+          } else {
+            invalidEmbeddingsCount++;
+          }
         }
 
         validRows.push({
@@ -226,6 +250,7 @@ export default function TabAsignaturas({
           actividades_de_aprendizaje: mapping.actividades_de_aprendizaje
             ? row[mapping.actividades_de_aprendizaje]?.trim() || null
             : null,
+          embedding_768: parsedEmb,
         });
       });
 
@@ -233,47 +258,11 @@ export default function TabAsignaturas({
         throw new Error("No se encontraron filas con el nombre de asignatura especificado.");
       }
 
-      // Generar embeddings si está habilitado
-      if (generateEmbeddings) {
-        setStatusMessage(`Generando embeddings (768d) para ${validRows.length} asignaturas con Gemini...`);
-        const BATCH_SIZE = 15;
-        const totalBatches = Math.ceil(validRows.length / BATCH_SIZE);
-
-        for (let b = 0; b < totalBatches; b++) {
-          const start = b * BATCH_SIZE;
-          const end = Math.min(start + BATCH_SIZE, validRows.length);
-          const currentBatch = validRows.slice(start, end);
-
-          const textsToEmbed = currentBatch.map((item) => formatAsignaturaForEmbedding(item));
-
-          setStatusMessage(
-            `Generando embeddings: lote ${b + 1} de ${totalBatches} (${start + 1}-${end} de ${validRows.length})...`
-          );
-          setUploadProgress(10 + Math.round(((b + 0.5) / totalBatches) * 60));
-
-          const embedRes = await apiFetch<{
-            success: boolean;
-            embeddings?: number[][];
-            error?: string;
-          }>("/api/embed", {
-            method: "POST",
-            body: JSON.stringify({ texts: textsToEmbed }),
-          });
-
-          if (!embedRes.success || !embedRes.embeddings) {
-            throw new Error(embedRes.error || `Error al generar embeddings en lote ${b + 1}`);
-          }
-
-          // Asignar los embeddings calculados a cada asignatura
-          embedRes.embeddings.forEach((emb, i) => {
-            currentBatch[i].embedding_768 = emb;
-          });
-        }
-      }
-
-      // Guardar en Supabase vía /api/asignaturas en lotes de 50
-      setStatusMessage("Guardando registros en la base de datos Supabase...");
-      setUploadProgress(75);
+      // Guardar directamente en Supabase vía /api/asignaturas en lotes de 50
+      setStatusMessage(
+        `Guardando ${validRows.length} registros en Supabase (${parsedEmbeddingsCount} con vector)...`
+      );
+      setUploadProgress(25);
 
       const DB_BATCH_SIZE = 50;
       const totalDbBatches = Math.ceil(validRows.length / DB_BATCH_SIZE);
@@ -299,15 +288,32 @@ export default function TabAsignaturas({
         }
 
         totalInserted += res.count || batchSlice.length;
-        setUploadProgress(75 + Math.round(((i + 1) / totalDbBatches) * 25));
+        setUploadProgress(25 + Math.round(((i + 1) / totalDbBatches) * 75));
       }
 
       setUploadProgress(100);
       setStatusMessage("¡Carga completada exitosamente!");
+
+      const observations: string[] = [...discardedRows];
+      if (mapping.embedding_768) {
+        if (invalidEmbeddingsCount > 0) {
+          observations.push(
+            `Aviso: En ${invalidEmbeddingsCount} filas no se pudo parsear el vector de la columna '${mapping.embedding_768}'.`
+          );
+        }
+        observations.push(
+          `Embeddings leídos del CSV: ${parsedEmbeddingsCount} de ${validRows.length} asignaturas guardadas.`
+        );
+      } else {
+        observations.push(
+          "No se asignó columna de embeddings. Las asignaturas se guardaron sin vector."
+        );
+      }
+
       setUploadReport({
         total: fileRows.length,
         success: totalInserted,
-        errors: discardedRows,
+        errors: observations,
       });
 
       // Refrescar catálogo de Supabase
@@ -323,66 +329,6 @@ export default function TabAsignaturas({
       });
     } finally {
       setIsUploading(false);
-    }
-  };
-
-  // ── Generar Embeddings para Registros Pendientes en Supabase ──
-  const handleGeneratePendingEmbeddings = async () => {
-    if (withoutEmbeddingCount === 0) return;
-    setIsFixingMissingEmbeddings(true);
-    try {
-      // 1. Obtener los registros sin embedding
-      const res = await apiFetch<{
-        success: boolean;
-        records: any[];
-      }>("/api/asignaturas?filter=without_embedding&limit=100");
-
-      if (!res.records || !res.records.length) {
-        alert("No se encontraron registros pendientes.");
-        return;
-      }
-
-      const pending = res.records;
-      const texts = pending.map((p) =>
-        formatAsignaturaForEmbedding({
-          nombre: p.nombre,
-          clave: p.clave,
-          contenido_tematico: p.contenido_tematico,
-          fines_de_aprendizaje_o_formacion: p.fines_de_aprendizaje_o_formacion,
-          actividades_de_aprendizaje: p.actividades_de_aprendizaje,
-        })
-      );
-
-      // 2. Generar embeddings
-      const embedRes = await apiFetch<{
-        success: boolean;
-        embeddings: number[][];
-      }>("/api/embed", {
-        method: "POST",
-        body: JSON.stringify({ texts }),
-      });
-
-      if (!embedRes.embeddings) throw new Error("Fallo al obtener embeddings");
-
-      // 3. Actualizar en Supabase
-      const payload = pending.map((p, idx) => ({
-        id: p.id,
-        nombre: p.nombre,
-        clave: p.clave,
-        embedding_768: embedRes.embeddings[idx],
-      }));
-
-      await apiFetch("/api/asignaturas", {
-        method: "POST",
-        body: JSON.stringify({ asignaturas: payload, mode: "upsert" }),
-      });
-
-      await loadDatabaseRecords();
-      alert(`¡Se generaron y guardaron embeddings para ${pending.length} asignaturas!`);
-    } catch (err: any) {
-      alert(`Error al generar embeddings pendientes: ${err.message}`);
-    } finally {
-      setIsFixingMissingEmbeddings(false);
     }
   };
 
@@ -404,6 +350,26 @@ export default function TabAsignaturas({
     }
   };
 
+  // Inspección de la columna de embeddings seleccionada para feedback en tiempo real
+  const embeddingSample = React.useMemo(() => {
+    if (!mapping.embedding_768 || fileRows.length === 0) return null;
+    const rawVal = fileRows[0][mapping.embedding_768];
+    if (!rawVal) return { status: "empty", length: 0, preview: "" };
+    const parsed = parseEmbeddingValue(rawVal);
+    if (!parsed) {
+      return {
+        status: "invalid",
+        length: 0,
+        preview: String(rawVal).slice(0, 80),
+      };
+    }
+    return {
+      status: parsed.length === 768 ? "valid_768" : "valid_other",
+      length: parsed.length,
+      preview: `[${parsed.slice(0, 3).map((n) => n.toFixed(4)).join(", ")}... +${parsed.length - 3} floats]`,
+    };
+  }, [mapping.embedding_768, fileRows]);
+
   // Columnas esperadas en Supabase con sus etiquetas y descripciones
   const targetFields: Array<{
     key: keyof ColumnMapping;
@@ -415,7 +381,13 @@ export default function TabAsignaturas({
       key: "nombre",
       label: "Nombre de la Asignatura",
       required: true,
-      description: "Título o denominación de la materia (requerido para matching y embedding)",
+      description: "Título o denominación de la materia (requerido para matching)",
+    },
+    {
+      key: "embedding_768",
+      label: "Columna de Embeddings / Vector (768d)",
+      required: false,
+      description: "Columna del CSV con el vector precalculado (ej. [0.012, -0.045, ...])",
     },
     {
       key: "clave",
@@ -549,6 +521,53 @@ export default function TabAsignaturas({
                 </span>
               </div>
 
+              {/* Badges de todas las columnas leídas del archivo */}
+              <div className="rounded-xl border border-white/10 bg-slate-900/60 p-3.5 space-y-2">
+                <div className="flex items-center justify-between text-[11px] text-slate-400">
+                  <span className="font-semibold text-slate-300">
+                    Todas las columnas detectadas en el archivo ({fileHeaders.length}):
+                  </span>
+                  <span>Selecciona la columna que contiene los embeddings en el formulario inferior</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {fileHeaders.map((header) => {
+                    const isEmbedding = header === mapping.embedding_768;
+                    const isMapped = Object.values(mapping).includes(header);
+                    return (
+                      <button
+                        key={header}
+                        type="button"
+                        onClick={() => {
+                          setMapping((prev) => ({
+                            ...prev,
+                            embedding_768: prev.embedding_768 === header ? "" : header,
+                          }));
+                        }}
+                        title={
+                          isEmbedding
+                            ? "Columna de embeddings seleccionada (clic para deseleccionar)"
+                            : "Haz clic para seleccionar esta columna como embedding"
+                        }
+                        className={`rounded-lg px-2.5 py-1 text-xs font-mono border transition flex items-center gap-1.5 ${
+                          isEmbedding
+                            ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-bold shadow-md shadow-purple-500/20 ring-1 ring-purple-400/40"
+                            : isMapped
+                            ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300 font-medium"
+                            : "border-white/10 bg-white/5 text-slate-400 hover:border-white/20 hover:text-white"
+                        }`}
+                      >
+                        <span>{header}</span>
+                        {isEmbedding && (
+                          <span className="rounded bg-purple-400/30 text-purple-200 text-[10px] px-1 py-0.2">
+                            Vector
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-1">
                 {targetFields.map((field) => {
                   const currentValue = mapping[field.key] || "";
@@ -558,7 +577,11 @@ export default function TabAsignaturas({
                   return (
                     <div
                       key={field.key}
-                      className="rounded-xl border border-white/10 bg-slate-900/90 p-3.5 space-y-2"
+                      className={`rounded-xl border p-3.5 space-y-2 transition ${
+                        field.key === "embedding_768"
+                          ? "border-purple-500/30 bg-purple-950/20 shadow-sm"
+                          : "border-white/10 bg-slate-900/90"
+                      }`}
                     >
                       <div className="flex items-center justify-between">
                         <label className="text-xs font-semibold text-white flex items-center gap-1.5">
@@ -568,7 +591,13 @@ export default function TabAsignaturas({
                           )}
                         </label>
                         {currentValue && (
-                          <span className="rounded bg-emerald-500/20 text-emerald-300 text-[10px] px-1.5 py-0.5 font-medium">
+                          <span
+                            className={`rounded text-[10px] px-1.5 py-0.5 font-medium ${
+                              field.key === "embedding_768"
+                                ? "bg-purple-500/25 text-purple-300"
+                                : "bg-emerald-500/20 text-emerald-300"
+                            }`}
+                          >
                             Mapeado
                           </span>
                         )}
@@ -589,7 +618,37 @@ export default function TabAsignaturas({
                         ))}
                       </select>
 
-                      {sampleVal && (
+                      {field.key === "embedding_768" && embeddingSample && (
+                        <div className="space-y-1 pt-1">
+                          {embeddingSample.status === "valid_768" && (
+                            <div className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2 text-[11px] text-emerald-300 font-medium">
+                              <CheckCircle2 className="h-3.5 w-3.5 flex-shrink-0" />
+                              <span>Vector compatible: 768 dimensiones detectadas</span>
+                            </div>
+                          )}
+                          {embeddingSample.status === "valid_other" && (
+                            <div className="flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] text-amber-300">
+                              <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                              <span>
+                                {embeddingSample.length} dimensiones (Supabase espera VECTOR(768))
+                              </span>
+                            </div>
+                          )}
+                          {embeddingSample.status === "invalid" && (
+                            <div className="flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 p-2 text-[11px] text-rose-300">
+                              <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                              <span>No se pudo interpretar el contenido como vector numérico</span>
+                            </div>
+                          )}
+                          {embeddingSample.preview && (
+                            <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-1.5 rounded">
+                              <span className="text-slate-500">Muestra:</span> {embeddingSample.preview}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {field.key !== "embedding_768" && sampleVal && (
                         <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-1.5 rounded">
                           <span className="text-slate-500">Muestra:</span> {sampleVal}
                         </p>
@@ -616,29 +675,46 @@ export default function TabAsignaturas({
                     <tr>
                       <th className="px-3 py-2">Clave</th>
                       <th className="px-3 py-2">Nombre de Asignatura</th>
+                      <th className="px-3 py-2">Embedding (CSV)</th>
                       <th className="px-3 py-2">Contenido Temático</th>
                       <th className="px-3 py-2">Objetivos / Fines</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5 text-slate-300">
-                    {fileRows.slice(0, 4).map((row, idx) => (
-                      <tr key={idx} className="hover:bg-white/[0.02]">
-                        <td className="px-3 py-2 font-mono text-indigo-300">
-                          {mapping.clave ? row[mapping.clave] || "—" : "—"}
-                        </td>
-                        <td className="px-3 py-2 font-medium text-white">
-                          {mapping.nombre ? row[mapping.nombre] || "—" : "—"}
-                        </td>
-                        <td className="px-3 py-2 truncate max-w-xs text-slate-400">
-                          {mapping.contenido_tematico ? row[mapping.contenido_tematico] || "—" : "—"}
-                        </td>
-                        <td className="px-3 py-2 truncate max-w-xs text-slate-400">
-                          {mapping.fines_de_aprendizaje_o_formacion
-                            ? row[mapping.fines_de_aprendizaje_o_formacion] || "—"
-                            : "—"}
-                        </td>
-                      </tr>
-                    ))}
+                    {fileRows.slice(0, 4).map((row, idx) => {
+                      const embVal = mapping.embedding_768 ? row[mapping.embedding_768] : null;
+                      const parsed = embVal ? parseEmbeddingValue(embVal) : null;
+                      return (
+                        <tr key={idx} className="hover:bg-white/[0.02]">
+                          <td className="px-3 py-2 font-mono text-indigo-300">
+                            {mapping.clave ? row[mapping.clave] || "—" : "—"}
+                          </td>
+                          <td className="px-3 py-2 font-medium text-white">
+                            {mapping.nombre ? row[mapping.nombre] || "—" : "—"}
+                          </td>
+                          <td className="px-3 py-2 font-mono text-xs">
+                            {parsed ? (
+                              <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                {parsed.length}d
+                              </span>
+                            ) : embVal ? (
+                              <span className="text-amber-400 text-[10px]">No válido</span>
+                            ) : (
+                              <span className="text-slate-500">—</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 truncate max-w-xs text-slate-400">
+                            {mapping.contenido_tematico ? row[mapping.contenido_tematico] || "—" : "—"}
+                          </td>
+                          <td className="px-3 py-2 truncate max-w-xs text-slate-400">
+                            {mapping.fines_de_aprendizaje_o_formacion
+                              ? row[mapping.fines_de_aprendizaje_o_formacion] || "—"
+                              : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -647,20 +723,14 @@ export default function TabAsignaturas({
             {/* Opciones y Acción de Subida */}
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-white/10 bg-indigo-950/20 p-4">
               <div className="space-y-1">
-                <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-white">
-                  <input
-                    type="checkbox"
-                    checked={generateEmbeddings}
-                    onChange={(e) => setGenerateEmbeddings(e.target.checked)}
-                    className="h-4 w-4 rounded border-white/20 bg-slate-900 text-indigo-600 focus:ring-indigo-500"
-                  />
-                  <span className="flex items-center gap-1.5">
-                    <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
-                    Generar embeddings multimodales (768d) con Gemini 2 antes de insertar
-                  </span>
-                </label>
-                <p className="text-[11px] text-slate-400 pl-6">
-                  Calcula el vector de similitud para cada programa de estudio garantizando matching instantáneo.
+                <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                  <Database className="h-4 w-4 text-indigo-400" />
+                  <span>Carga directa de catálogo con embeddings</span>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  {mapping.embedding_768
+                    ? `Los embeddings se leerán directamente de la columna '${mapping.embedding_768}' del archivo.`
+                    : "No se seleccionó columna de embeddings. Las materias se guardarán sin vector."}
                 </p>
               </div>
 
@@ -754,21 +824,6 @@ export default function TabAsignaturas({
           </div>
 
           <div className="flex items-center gap-3">
-            {withoutEmbeddingCount > 0 && (
-              <button
-                type="button"
-                onClick={handleGeneratePendingEmbeddings}
-                disabled={isFixingMissingEmbeddings}
-                className="flex items-center gap-1.5 rounded-xl border border-indigo-500/40 bg-indigo-500/20 px-3.5 py-1.5 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/30 transition disabled:opacity-50"
-              >
-                <Sparkles className="h-3.5 w-3.5" />
-                <span>
-                  {isFixingMissingEmbeddings
-                    ? "Generando..."
-                    : `Vectorizar ${withoutEmbeddingCount} pendientes`}
-                </span>
-              </button>
-            )}
 
             <button
               type="button"
