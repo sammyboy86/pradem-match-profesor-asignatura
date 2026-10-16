@@ -14,6 +14,7 @@ export interface Asignatura {
   dot_product_match?: number | null;
   embedding_768?: number[] | null;
   created_at?: string;
+  [key: string]: unknown;
 }
 
 export interface AsignaturaUploadRow {

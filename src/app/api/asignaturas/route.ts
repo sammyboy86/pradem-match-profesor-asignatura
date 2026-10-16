@@ -108,25 +108,95 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Limpiar y preparar payload
-    const payload = asignaturas.map((a) => {
-      const item: any = {
-        nombre: a.nombre.trim(),
-        clave: a.clave ? String(a.clave).trim() : null,
-        fines_de_aprendizaje_o_formacion: a.fines_de_aprendizaje_o_formacion || null,
-        contenido_tematico: a.contenido_tematico || null,
-        actividades_de_aprendizaje: a.actividades_de_aprendizaje || null,
-      };
+    // Columnas base del esquema public.asignaturas
+    const tableColumns = new Set([
+      "clave",
+      "nombre",
+      "fines_de_aprendizaje_o_formacion",
+      "contenido_tematico",
+      "actividades_de_aprendizaje",
+      "match_nombre",
+      "match_semantico",
+      "dot_product_match",
+      "embedding_768",
+    ]);
 
-      if (a.embedding_768) {
-        if (Array.isArray(a.embedding_768) && a.embedding_768.length > 0) {
-          item.embedding_768 = a.embedding_768;
-        } else if (typeof a.embedding_768 === "string") {
-          const parsed = parseEmbeddingValue(a.embedding_768);
-          if (parsed && parsed.length > 0) {
-            item.embedding_768 = parsed;
+    // Consultar dinámicamente si la tabla tiene más columnas en Supabase
+    try {
+      const { data: sampleRow } = await supabase.from("asignaturas").select("*").limit(1);
+      if (sampleRow && sampleRow.length > 0) {
+        Object.keys(sampleRow[0]).forEach((c) => tableColumns.add(c.toLowerCase()));
+      }
+    } catch {
+      // Ignorar si la tabla está vacía
+    }
+
+    // Limpiar y preparar payload con TODAS las columnas del CSV compatibles
+    const payload = asignaturas.map((a) => {
+      const item: any = {};
+
+      Object.entries(a).forEach(([rawKey, val]) => {
+        const normKey = rawKey
+          .trim()
+          .toLowerCase()
+          .replace(/[\s-]+/g, "_")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "");
+
+        if (normKey === "id" && !val) return;
+        if (normKey === "created_at") return;
+
+        // Tratar campo de embedding
+        if (normKey === "embedding_768" || normKey === "embedding" || normKey === "vector" || normKey === "embeddings") {
+          if (val) {
+            if (Array.isArray(val) && val.length > 0) {
+              item.embedding_768 = val;
+            } else if (typeof val === "string") {
+              const parsed = parseEmbeddingValue(val);
+              if (parsed && parsed.length > 0) {
+                item.embedding_768 = parsed;
+              }
+            }
+          }
+          return;
+        }
+
+        // Normalizar aliases comunes a columnas oficiales
+        let targetKey = normKey;
+        if (normKey === "fines_de_aprendizaje" || normKey === "objetivos" || normKey === "objetivo") {
+          targetKey = "fines_de_aprendizaje_o_formacion";
+        } else if (normKey === "temario" || normKey === "contenido" || normKey === "temas") {
+          targetKey = "contenido_tematico";
+        } else if (normKey === "actividades" || normKey === "estrategias") {
+          targetKey = "actividades_de_aprendizaje";
+        } else if (normKey === "codigo" || normKey === "cve") {
+          targetKey = "clave";
+        } else if (normKey === "asignatura" || normKey === "materia") {
+          targetKey = "nombre";
+        }
+
+        // Si la columna pertenece a las columnas de la tabla Supabase
+        if (tableColumns.has(targetKey)) {
+          if (targetKey === "match_nombre" || targetKey === "match_semantico") {
+            item[targetKey] =
+              val === true ||
+              String(val).toLowerCase() === "true" ||
+              String(val) === "1" ||
+              String(val).toLowerCase() === "t";
+          } else if (targetKey === "dot_product_match") {
+            const num = parseFloat(String(val));
+            item[targetKey] = !isNaN(num) ? num : null;
+          } else if (typeof val === "string") {
+            item[targetKey] = val.trim() !== "" ? val.trim() : null;
+          } else {
+            item[targetKey] = val != null ? val : null;
           }
         }
+      });
+
+      // Asegurar que nombre esté presente y limpio
+      if (!item.nombre && a.nombre) {
+        item.nombre = String(a.nombre).trim();
       }
 
       return item;

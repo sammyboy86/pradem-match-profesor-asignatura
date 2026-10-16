@@ -54,6 +54,7 @@ export default function TabAsignaturas({
 
   // Opciones de Carga
   const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("upsert");
+  const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
 
   // Progreso de Carga
   const [isUploading, setIsUploading] = useState(false);
@@ -204,54 +205,74 @@ export default function TabAsignaturas({
 
   // ── Ejecutar Carga a Supabase ──
   const handleUploadToSupabase = async () => {
-    if (!mapping.nombre) {
-      alert("Debes mapear al menos la columna obligatoria 'Nombre de la Asignatura'.");
-      return;
-    }
+    // Detectar columna de nombre automáticamente si no se mapeó explícitamente
+    const detectedNombreCol =
+      mapping.nombre ||
+      fileHeaders.find((h) => {
+        const n = h.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        return n.includes("nombre") || n.includes("asignatura") || n.includes("materia");
+      }) ||
+      fileHeaders.find((h) => h !== mapping.embedding_768) ||
+      fileHeaders[0];
 
     setIsUploading(true);
     setUploadProgress(10);
-    setStatusMessage("Preparando asignaturas para inserción...");
+    setStatusMessage("Preparando todas las columnas para inserción en Supabase...");
     setUploadReport(null);
 
     try {
-      // Filtrar filas válidas que tengan nombre y extraer embeddings si fueron mapeados
+      // Filtrar filas válidas incluyendo TODAS las columnas del CSV
       const validRows: Asignatura[] = [];
       const discardedRows: string[] = [];
       let parsedEmbeddingsCount = 0;
       let invalidEmbeddingsCount = 0;
 
       fileRows.forEach((row, idx) => {
-        const nombreVal = mapping.nombre ? row[mapping.nombre]?.trim() : "";
-        if (!nombreVal) {
+        const rawNombre = detectedNombreCol ? row[detectedNombreCol]?.trim() : "";
+        if (!rawNombre) {
           discardedRows.push(`Fila ${idx + 1}: Sin nombre de asignatura`);
           return;
         }
 
-        let parsedEmb: number[] | null = null;
+        // Subir TODAS las columnas del CSV por defecto
+        const rowData: Record<string, any> = { ...row };
+
+        // Asegurar que 'nombre' esté presente
+        rowData.nombre = rawNombre;
+
+        // Si hay mapeo de clave específico
+        if (mapping.clave && row[mapping.clave]) {
+          rowData.clave = row[mapping.clave].trim();
+        }
+
+        // Si hay mapeos explícitos opcionales
+        if (mapping.contenido_tematico && row[mapping.contenido_tematico]) {
+          rowData.contenido_tematico = row[mapping.contenido_tematico].trim();
+        }
+        if (mapping.fines_de_aprendizaje_o_formacion && row[mapping.fines_de_aprendizaje_o_formacion]) {
+          rowData.fines_de_aprendizaje_o_formacion = row[mapping.fines_de_aprendizaje_o_formacion].trim();
+        }
+        if (mapping.actividades_de_aprendizaje && row[mapping.actividades_de_aprendizaje]) {
+          rowData.actividades_de_aprendizaje = row[mapping.actividades_de_aprendizaje].trim();
+        }
+
+        // Parsear embedding de la columna seleccionada
         if (mapping.embedding_768 && row[mapping.embedding_768]) {
-          parsedEmb = parseEmbeddingValue(row[mapping.embedding_768]);
+          const parsedEmb = parseEmbeddingValue(row[mapping.embedding_768]);
           if (parsedEmb) {
+            rowData.embedding_768 = parsedEmb;
             parsedEmbeddingsCount++;
           } else {
             invalidEmbeddingsCount++;
           }
+
+          // Si el header del archivo no se llamaba 'embedding_768', remover el valor string original
+          if (mapping.embedding_768 !== "embedding_768") {
+            delete rowData[mapping.embedding_768];
+          }
         }
 
-        validRows.push({
-          nombre: nombreVal,
-          clave: mapping.clave ? row[mapping.clave]?.trim() || null : null,
-          fines_de_aprendizaje_o_formacion: mapping.fines_de_aprendizaje_o_formacion
-            ? row[mapping.fines_de_aprendizaje_o_formacion]?.trim() || null
-            : null,
-          contenido_tematico: mapping.contenido_tematico
-            ? row[mapping.contenido_tematico]?.trim() || null
-            : null,
-          actividades_de_aprendizaje: mapping.actividades_de_aprendizaje
-            ? row[mapping.actividades_de_aprendizaje]?.trim() || null
-            : null,
-          embedding_768: parsedEmb,
-        });
+        validRows.push(rowData as Asignatura);
       });
 
       if (!validRows.length) {
@@ -508,31 +529,117 @@ export default function TabAsignaturas({
         ) : (
           /* Mapeador de Columnas Interactivo */
           <div className="space-y-6">
-            <div className="rounded-xl border border-white/10 bg-slate-950/60 p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Sliders className="h-4 w-4 text-indigo-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                    Mapeo de Columnas (Archivo ➔ Supabase)
-                  </h3>
+            {/* 1. SELECCIÓN DESTACADA DE LA COLUMNA DE EMBEDDINGS */}
+            <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-5 space-y-4 shadow-lg shadow-purple-950/20">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="rounded-lg bg-purple-500/20 p-2 text-purple-300 border border-purple-500/30">
+                    <Sparkles className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      Columna de Embeddings / Vector (768d)
+                      <span className="text-[10px] rounded-full bg-purple-500/30 px-2 py-0.5 text-purple-200 border border-purple-400/30 font-semibold">
+                        Requerida para matching
+                      </span>
+                    </h3>
+                    <p className="text-xs text-purple-200/70">
+                      Selecciona cuál de las columnas del CSV contiene los vectores precalculados.
+                    </p>
+                  </div>
                 </div>
-                <span className="text-[11px] text-slate-400">
-                  Verifica o cambia la correspondencia de cada campo
-                </span>
+
+                {mapping.embedding_768 && (
+                  <span className="rounded-lg bg-purple-500/20 border border-purple-500/40 text-purple-200 text-xs px-2.5 py-1 font-mono font-semibold">
+                    Columna activa: {mapping.embedding_768}
+                  </span>
+                )}
               </div>
 
-              {/* Badges de todas las columnas leídas del archivo */}
-              <div className="rounded-xl border border-white/10 bg-slate-900/60 p-3.5 space-y-2">
-                <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span className="font-semibold text-slate-300">
-                    Todas las columnas detectadas en el archivo ({fileHeaders.length}):
-                  </span>
-                  <span>Selecciona la columna que contiene los embeddings en el formulario inferior</span>
+              {/* Selector principal de la columna de embedding */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-300">
+                    Columna con los embeddings del CSV:
+                  </label>
+                  <select
+                    value={mapping.embedding_768 || ""}
+                    onChange={(e) =>
+                      setMapping((prev) => ({ ...prev, embedding_768: e.target.value }))
+                    }
+                    className="w-full rounded-xl border border-purple-400/30 bg-slate-950 px-3.5 py-2.5 text-xs text-white focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 font-medium"
+                  >
+                    <option value="">-- Seleccionar columna de embeddings (o ninguna) --</option>
+                    {fileHeaders.map((header) => (
+                      <option key={header} value={header}>
+                        {header}
+                      </option>
+                    ))}
+                  </select>
                 </div>
+
+                {/* Panel de validación visual del vector */}
+                <div>
+                  {embeddingSample ? (
+                    <div className="space-y-1.5 pt-1">
+                      {embeddingSample.status === "valid_768" && (
+                        <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-300 font-medium">
+                          <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
+                          <div>
+                            <p className="font-bold">¡Vector compatible detectado!</p>
+                            <p className="text-[11px] text-emerald-400/80">
+                              768 dimensiones numéricas confirmadas en la muestra de la primera fila.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      {embeddingSample.status === "valid_other" && (
+                        <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300 font-medium">
+                          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                          <div>
+                            <p className="font-bold">{embeddingSample.length} dimensiones detectadas</p>
+                            <p className="text-[11px] text-amber-400/80">
+                              Supabase espera un vector de 768 dimensiones.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      {embeddingSample.status === "invalid" && (
+                        <div className="flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300 font-medium">
+                          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                          <div>
+                            <p className="font-bold">Formato de vector no reconocido</p>
+                            <p className="text-[11px] text-rose-400/80">
+                              No se pudieron extraer números flotantes de la celda de muestra.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      {embeddingSample.preview && (
+                        <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-2 rounded-lg border border-white/5">
+                          <span className="text-slate-500 font-sans">Muestra fila 1:</span> {embeddingSample.preview}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-white/10 bg-slate-900/60 p-3 text-xs text-slate-400">
+                      <p className="text-slate-300 font-medium">Ninguna columna seleccionada como vector</p>
+                      <p className="text-[11px] mt-0.5">
+                        Si tu CSV no contiene embeddings, las asignaturas se cargarán como texto plano.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Badges para seleccionar columna de vector con un clic */}
+              <div className="pt-2 border-t border-purple-500/20 space-y-1.5">
+                <span className="text-[11px] font-medium text-purple-200/80">
+                  Haz clic en cualquier columna del archivo para asignarla como vector:
+                </span>
                 <div className="flex flex-wrap gap-1.5">
                   {fileHeaders.map((header) => {
                     const isEmbedding = header === mapping.embedding_768;
-                    const isMapped = Object.values(mapping).includes(header);
                     return (
                       <button
                         key={header}
@@ -543,23 +650,16 @@ export default function TabAsignaturas({
                             embedding_768: prev.embedding_768 === header ? "" : header,
                           }));
                         }}
-                        title={
-                          isEmbedding
-                            ? "Columna de embeddings seleccionada (clic para deseleccionar)"
-                            : "Haz clic para seleccionar esta columna como embedding"
-                        }
                         className={`rounded-lg px-2.5 py-1 text-xs font-mono border transition flex items-center gap-1.5 ${
                           isEmbedding
-                            ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-bold shadow-md shadow-purple-500/20 ring-1 ring-purple-400/40"
-                            : isMapped
-                            ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300 font-medium"
-                            : "border-white/10 bg-white/5 text-slate-400 hover:border-white/20 hover:text-white"
+                            ? "border-purple-400 bg-purple-500/30 text-white font-bold shadow-md shadow-purple-500/30 ring-1 ring-purple-400"
+                            : "border-white/10 bg-white/5 text-slate-300 hover:border-purple-500/40 hover:text-white"
                         }`}
                       >
                         <span>{header}</span>
                         {isEmbedding && (
-                          <span className="rounded bg-purple-400/30 text-purple-200 text-[10px] px-1 py-0.2">
-                            Vector
+                          <span className="rounded bg-purple-400/30 text-purple-200 text-[10px] px-1 font-sans">
+                            Vector ✓
                           </span>
                         )}
                       </button>
@@ -567,99 +667,75 @@ export default function TabAsignaturas({
                   })}
                 </div>
               </div>
+            </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-1">
-                {targetFields.map((field) => {
-                  const currentValue = mapping[field.key] || "";
-                  const sampleVal =
-                    currentValue && fileRows.length > 0 ? fileRows[0][currentValue] : null;
+            {/* 2. TODAS LAS COLUMNAS A SUBIR POR DEFECTO */}
+            <div className="rounded-xl border border-white/10 bg-slate-950/60 p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                    Se subirán automáticamente TODAS las columnas del archivo ({fileHeaders.length}):
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedMapping((prev) => !prev)}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 underline font-medium"
+                >
+                  {showAdvancedMapping ? "Ocultar mapeo manual" : "Mapeo manual avanzado (opcional)"}
+                </button>
+              </div>
 
+              <div className="flex flex-wrap gap-1.5">
+                {fileHeaders.map((header) => {
+                  const isEmbedding = header === mapping.embedding_768;
                   return (
-                    <div
-                      key={field.key}
-                      className={`rounded-xl border p-3.5 space-y-2 transition ${
-                        field.key === "embedding_768"
-                          ? "border-purple-500/30 bg-purple-950/20 shadow-sm"
-                          : "border-white/10 bg-slate-900/90"
+                    <span
+                      key={header}
+                      className={`rounded-lg px-2.5 py-1 text-xs font-mono border ${
+                        isEmbedding
+                          ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-bold"
+                          : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 font-medium"
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-semibold text-white flex items-center gap-1.5">
-                          {field.label}
-                          {field.required && (
-                            <span className="text-[10px] text-rose-400 font-bold">*</span>
-                          )}
-                        </label>
-                        {currentValue && (
-                          <span
-                            className={`rounded text-[10px] px-1.5 py-0.5 font-medium ${
-                              field.key === "embedding_768"
-                                ? "bg-purple-500/25 text-purple-300"
-                                : "bg-emerald-500/20 text-emerald-300"
-                            }`}
-                          >
-                            Mapeado
-                          </span>
-                        )}
-                      </div>
-
-                      <select
-                        value={currentValue}
-                        onChange={(e) =>
-                          setMapping((prev) => ({ ...prev, [field.key]: e.target.value }))
-                        }
-                        className="w-full rounded-lg border border-white/15 bg-slate-950 px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                      >
-                        <option value="">-- No mapear / Omitir --</option>
-                        {fileHeaders.map((header) => (
-                          <option key={header} value={header}>
-                            {header}
-                          </option>
-                        ))}
-                      </select>
-
-                      {field.key === "embedding_768" && embeddingSample && (
-                        <div className="space-y-1 pt-1">
-                          {embeddingSample.status === "valid_768" && (
-                            <div className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2 text-[11px] text-emerald-300 font-medium">
-                              <CheckCircle2 className="h-3.5 w-3.5 flex-shrink-0" />
-                              <span>Vector compatible: 768 dimensiones detectadas</span>
-                            </div>
-                          )}
-                          {embeddingSample.status === "valid_other" && (
-                            <div className="flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] text-amber-300">
-                              <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
-                              <span>
-                                {embeddingSample.length} dimensiones (Supabase espera VECTOR(768))
-                              </span>
-                            </div>
-                          )}
-                          {embeddingSample.status === "invalid" && (
-                            <div className="flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 p-2 text-[11px] text-rose-300">
-                              <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
-                              <span>No se pudo interpretar el contenido como vector numérico</span>
-                            </div>
-                          )}
-                          {embeddingSample.preview && (
-                            <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-1.5 rounded">
-                              <span className="text-slate-500">Muestra:</span> {embeddingSample.preview}
-                            </p>
-                          )}
-                        </div>
-                      )}
-
-                      {field.key !== "embedding_768" && sampleVal && (
-                        <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-1.5 rounded">
-                          <span className="text-slate-500">Muestra:</span> {sampleVal}
-                        </p>
-                      )}
-                    </div>
+                      {header}
+                      {isEmbedding && " (Vector 768d)"}
+                    </span>
                   );
                 })}
               </div>
+
+              {/* Mapeo manual opcional */}
+              {showAdvancedMapping && (
+                <div className="pt-4 border-t border-white/10 space-y-3 animate-in fade-in">
+                  <p className="text-[11px] text-slate-400">
+                    Por defecto las columnas se asocian automáticamente con la tabla. Solo utiliza estos selectores si los nombres en tu archivo difieren significativamente.
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {targetFields.map((field) => (
+                      <div key={field.key} className="rounded-lg border border-white/10 bg-slate-900/90 p-3 space-y-1.5">
+                        <label className="text-xs font-semibold text-white">{field.label}</label>
+                        <select
+                          value={mapping[field.key] || ""}
+                          onChange={(e) => setMapping((prev) => ({ ...prev, [field.key]: e.target.value }))}
+                          className="w-full rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                        >
+                          <option value="">-- Detección automática --</option>
+                          {fileHeaders.map((h) => (
+                            <option key={h} value={h}>
+                              {h}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
-            {/* Vista Previa de Filas Mapeadas */}
+            {/* 3. VISTA PREVIA DE FILAS */}
             <div className="rounded-xl border border-white/10 bg-slate-950/40 p-4 space-y-3">
               <div className="flex items-center justify-between text-xs text-slate-400">
                 <span className="flex items-center gap-1.5 font-medium text-slate-300">
@@ -673,48 +749,47 @@ export default function TabAsignaturas({
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-900 text-slate-400 uppercase text-[10px] tracking-wider">
                     <tr>
-                      <th className="px-3 py-2">Clave</th>
-                      <th className="px-3 py-2">Nombre de Asignatura</th>
-                      <th className="px-3 py-2">Embedding (CSV)</th>
-                      <th className="px-3 py-2">Contenido Temático</th>
-                      <th className="px-3 py-2">Objetivos / Fines</th>
+                      {fileHeaders.slice(0, 6).map((h) => (
+                        <th key={h} className="px-3 py-2">
+                          {h}
+                          {h === mapping.embedding_768 && (
+                            <span className="ml-1 text-purple-300 font-bold">(Vector)</span>
+                          )}
+                        </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5 text-slate-300">
-                    {fileRows.slice(0, 4).map((row, idx) => {
-                      const embVal = mapping.embedding_768 ? row[mapping.embedding_768] : null;
-                      const parsed = embVal ? parseEmbeddingValue(embVal) : null;
-                      return (
-                        <tr key={idx} className="hover:bg-white/[0.02]">
-                          <td className="px-3 py-2 font-mono text-indigo-300">
-                            {mapping.clave ? row[mapping.clave] || "—" : "—"}
-                          </td>
-                          <td className="px-3 py-2 font-medium text-white">
-                            {mapping.nombre ? row[mapping.nombre] || "—" : "—"}
-                          </td>
-                          <td className="px-3 py-2 font-mono text-xs">
-                            {parsed ? (
-                              <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
-                                <CheckCircle2 className="h-3.5 w-3.5" />
-                                {parsed.length}d
-                              </span>
-                            ) : embVal ? (
-                              <span className="text-amber-400 text-[10px]">No válido</span>
-                            ) : (
-                              <span className="text-slate-500">—</span>
-                            )}
-                          </td>
-                          <td className="px-3 py-2 truncate max-w-xs text-slate-400">
-                            {mapping.contenido_tematico ? row[mapping.contenido_tematico] || "—" : "—"}
-                          </td>
-                          <td className="px-3 py-2 truncate max-w-xs text-slate-400">
-                            {mapping.fines_de_aprendizaje_o_formacion
-                              ? row[mapping.fines_de_aprendizaje_o_formacion] || "—"
-                              : "—"}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {fileRows.slice(0, 4).map((row, idx) => (
+                      <tr key={idx} className="hover:bg-white/[0.02]">
+                        {fileHeaders.slice(0, 6).map((h) => {
+                          const val = row[h];
+                          const isEmbedding = h === mapping.embedding_768;
+                          if (isEmbedding) {
+                            const parsed = val ? parseEmbeddingValue(val) : null;
+                            return (
+                              <td key={h} className="px-3 py-2 font-mono text-xs">
+                                {parsed ? (
+                                  <span className="inline-flex items-center gap-1 text-emerald-400 font-semibold">
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                    {parsed.length}d ✓
+                                  </span>
+                                ) : val ? (
+                                  <span className="text-amber-400 text-[10px]">No válido</span>
+                                ) : (
+                                  <span className="text-slate-500">—</span>
+                                )}
+                              </td>
+                            );
+                          }
+                          return (
+                            <td key={h} className="px-3 py-2 truncate max-w-xs font-mono text-slate-300">
+                              {val || "—"}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
