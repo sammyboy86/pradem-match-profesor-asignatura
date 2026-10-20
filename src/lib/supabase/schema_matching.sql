@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_asignaturas_embedding_768
 ON public.asignaturas 
 USING hnsw (embedding_768 vector_cosine_ops);
 
-CREATE INDEX IF NOT EXISTS idx_asignaturas_clave ON public.asignaturas(clave);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asignaturas_clave ON public.asignaturas(clave);
 CREATE INDEX IF NOT EXISTS idx_asignaturas_nombre ON public.asignaturas(nombre);
 
 -- Habilitar RLS

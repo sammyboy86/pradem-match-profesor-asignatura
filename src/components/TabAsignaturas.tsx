@@ -53,7 +53,7 @@ export default function TabAsignaturas({
   });
 
   // Opciones de Carga
-  const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("upsert");
+  const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("insert");
   const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
 
   // Progreso de Carga
@@ -815,8 +815,8 @@ export default function TabAsignaturas({
                   onChange={(e) => setUpsertMode(e.target.value as "upsert" | "insert")}
                   className="rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white"
                 >
-                  <option value="upsert">Modo: Upsert (Actualizar por clave)</option>
-                  <option value="insert">Modo: Insert (Siempre nuevo registro)</option>
+                  <option value="insert">Modo: Insert (Siempre nuevo registro - Recomendado)</option>
+                  <option value="upsert">Modo: Upsert (Actualizar por clave única)</option>
                 </select>
 
                 <button

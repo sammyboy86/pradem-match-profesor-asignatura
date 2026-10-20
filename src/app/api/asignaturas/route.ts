@@ -204,11 +204,28 @@ export async function POST(req: NextRequest) {
 
     let result;
     if (mode === "upsert") {
-      // Upsert basado en clave o nombre si tiene clave
+      // Upsert basado en clave si está disponible
       result = await supabase
         .from("asignaturas")
         .upsert(payload, { onConflict: "clave" })
         .select("id, clave, nombre");
+
+      // Si falla por falta de restricción única en 'clave' (código 42P10 o mensaje ON CONFLICT), realizar fallback a insert
+      if (
+        result.error &&
+        (result.error.code === "42P10" ||
+          result.error.message?.includes("unique or exclusion constraint") ||
+          result.error.message?.includes("ON CONFLICT"))
+      ) {
+        console.warn(
+          "No existe constraint UNIQUE en 'clave' en Supabase. Realizando fallback automático a insert:",
+          result.error.message
+        );
+        result = await supabase
+          .from("asignaturas")
+          .insert(payload)
+          .select("id, clave, nombre");
+      }
     } else {
       result = await supabase
         .from("asignaturas")
