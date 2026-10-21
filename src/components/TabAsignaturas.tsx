@@ -46,6 +46,7 @@ export default function TabAsignaturas({
   const [mapping, setMapping] = useState<ColumnMapping>({
     clave: "",
     nombre: "",
+    cluster: "",
     fines_de_aprendizaje_o_formacion: "",
     contenido_tematico: "",
     actividades_de_aprendizaje: "",
@@ -72,6 +73,7 @@ export default function TabAsignaturas({
       id: number;
       clave: string | null;
       nombre: string;
+      cluster?: string | null;
       contenido_tematico: string | null;
       hasEmbedding: boolean;
       created_at: string;
@@ -140,6 +142,7 @@ export default function TabAsignaturas({
     return {
       nombre: findMatch(["nombre", "asignatura", "materia", "unidad", "curso", "title"]),
       clave: findMatch(["clave", "codigo", "code", "id", "cod"]),
+      cluster: findMatch(["cluster", "area", "grupo", "departamento", "bloque", "categoria"]),
       embedding_768: findMatch([
         "embedding768",
         "embedding_768",
@@ -243,6 +246,11 @@ export default function TabAsignaturas({
         // Si hay mapeo de clave específico
         if (mapping.clave && row[mapping.clave]) {
           rowData.clave = row[mapping.clave].trim();
+        }
+
+        // Si hay mapeo de cluster
+        if (mapping.cluster && row[mapping.cluster]) {
+          rowData.cluster = row[mapping.cluster].trim();
         }
 
         // Si hay mapeos explícitos opcionales
@@ -415,6 +423,12 @@ export default function TabAsignaturas({
       label: "Clave / Código",
       required: false,
       description: "Identificador único de la asignatura (utilizado como clave de conflicto en Upsert)",
+    },
+    {
+      key: "cluster",
+      label: "Cluster / Área / Departamento",
+      required: false,
+      description: "Grupo o cluster de la asignatura para configuración de betas ponderadas",
     },
     {
       key: "contenido_tematico",
@@ -1002,6 +1016,7 @@ export default function TabAsignaturas({
                 <tr>
                   <th className="px-4 py-3">ID / Clave</th>
                   <th className="px-4 py-3">Nombre Asignatura</th>
+                  <th className="px-4 py-3">Cluster</th>
                   <th className="px-4 py-3">Contenido Temático</th>
                   <th className="px-4 py-3 text-center">Estado Vectorial</th>
                 </tr>
@@ -1009,14 +1024,14 @@ export default function TabAsignaturas({
               <tbody className="divide-y divide-white/5 text-slate-300">
                 {loadingDb ? (
                   <tr>
-                    <td colSpan={4} className="px-4 py-8 text-center text-slate-400">
+                    <td colSpan={5} className="px-4 py-8 text-center text-slate-400">
                       <RefreshCw className="h-5 w-5 animate-spin mx-auto mb-2 text-indigo-400" />
                       Cargando asignaturas de Supabase...
                     </td>
                   </tr>
                 ) : dbRecords.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="px-4 py-8 text-center text-slate-400">
+                    <td colSpan={5} className="px-4 py-8 text-center text-slate-400">
                       No se encontraron asignaturas registradas. Carga tu archivo arriba para comenzar.
                     </td>
                   </tr>
@@ -1028,6 +1043,15 @@ export default function TabAsignaturas({
                       </td>
                       <td className="px-4 py-3 font-medium text-white max-w-sm">
                         {item.nombre}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs text-cyan-300">
+                        {item.cluster ? (
+                          <span className="rounded bg-cyan-500/15 border border-cyan-500/30 px-2 py-0.5 text-cyan-200">
+                            {item.cluster}
+                          </span>
+                        ) : (
+                          <span className="text-slate-500">—</span>
+                        )}
                       </td>
                       <td className="px-4 py-3 truncate max-w-md text-slate-400">
                         {item.contenido_tematico || "—"}

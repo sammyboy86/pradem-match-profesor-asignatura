@@ -57,7 +57,7 @@ export async function POST(req: NextRequest) {
       pagePromises.push(
         supabase
           .from("asignaturas")
-          .select("id, clave, nombre, contenido_tematico, match_nombre")
+          .select("id, clave, nombre, cluster, contenido_tematico, match_nombre")
           .range(from, to)
       );
     }
@@ -86,6 +86,7 @@ export async function POST(req: NextRequest) {
           clave: row.clave,
           cleanClave: cClean,
           nombre: row.nombre,
+          cluster: row.cluster || null,
           contenido_tematico: row.contenido_tematico || "",
           match_nombre: Boolean(row.match_nombre),
           hasEmbedding: true,

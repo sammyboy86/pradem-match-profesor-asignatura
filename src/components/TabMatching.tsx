@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
   Users,
   Upload,
@@ -28,20 +28,38 @@ import {
   Trash2,
   ListFilter,
   BookOpen,
+  ShieldCheck,
+  Cpu,
+  Tag,
+  Plus,
+  Equal,
+  Copy,
+  RotateCcw,
+  Info,
 } from "lucide-react";
 import {
   Profesor,
   QueryConfig,
   ProfesorMatchResult,
+  ProfesorEmbeddingResult,
   MatchResultItem,
   FilteredAsignatura,
   FilterClavesResponse,
+  ProfessorImportMode,
+  RegexFilterConfig,
 } from "@/types";
+import {
+  DEFAULT_REGEX_FILTER_CONFIG,
+  sanitizarCvParaModelo,
+} from "@/lib/sanitizer/cv-sanitizer";
+import { RegexFilterModal } from "@/components/RegexFilterModal";
 import {
   parseSpreadsheetFile,
   apiFetch,
   exportToExcel,
   exportToCsv,
+  formatEmbeddingForExport,
+  parseEmbeddingValue,
   cleanClave,
 } from "@/lib/utils";
 
@@ -50,6 +68,19 @@ interface TabMatchingProps {
 }
 
 export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
+  // ── Modo de Importación de Profesores ──
+  const [importMode, setImportMode] = useState<ProfessorImportMode>("generate");
+
+  // ── Configuración de Clusters y Betas ──
+  const [clusterColumn, setClusterColumn] = useState<string>("cluster");
+  const [availableClusterColumns, setAvailableClusterColumns] = useState<string[]>(["cluster"]);
+  const [detectedClusters, setDetectedClusters] = useState<string[]>([]);
+  const [customClusters, setCustomClusters] = useState<string[]>([]);
+  const [selectedClusterTab, setSelectedClusterTab] = useState<string>("__default__");
+  const [clusterBetas, setClusterBetas] = useState<Record<string, Record<string, number>>>({});
+  const [defaultBetas, setDefaultBetas] = useState<Record<string, number>>({});
+  const [newClusterName, setNewClusterName] = useState<string>("");
+  const [isLoadingClusters, setIsLoadingClusters] = useState<boolean>(false);
   // ── Estados de Filtro Inicial de Asignaturas (Paso 1: Filtro por Claves) ──
   const [filterFile, setFilterFile] = useState<File | null>(null);
   const [filterHeaders, setFilterHeaders] = useState<string[]>([]);
@@ -91,11 +122,57 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [matchProgress, setMatchProgress] = useState(0);
   const [matchStatusText, setMatchStatusText] = useState("");
   const [matchResults, setMatchResults] = useState<ProfesorMatchResult[]>([]);
+  const [rateLimiterStats, setRateLimiterStats] = useState<{
+    currentWindowRequests: number;
+    maxRpm: number;
+    rpmUtilizationPct: number;
+    currentWindowTokens: number;
+    maxTpm: number;
+    tpmUtilizationPct: number;
+    totalRequestsLifetime: number;
+    totalTokensLifetime: number;
+    total429Retries: number;
+  } | null>(null);
+
+  // Generación exclusiva de Embeddings de Profesores (sin matching)
+  const [isEmbeddingOnly, setIsEmbeddingOnly] = useState(false);
+  const [embedOnlyProgress, setEmbedOnlyProgress] = useState(0);
+  const [embedOnlyStatusText, setEmbedOnlyStatusText] = useState("");
+  const [professorEmbeddingsList, setProfessorEmbeddingsList] = useState<ProfesorEmbeddingResult[]>([]);
 
   // Estados de visualización y acordeón
   const [expandedProfessorIds, setExpandedProfessorIds] = useState<Record<string, boolean>>({});
   const [searchFilter, setSearchFilter] = useState("");
   const [filterOnlyWithMatches, setFilterOnlyWithMatches] = useState(false);
+
+  // ── Filtro Regex Anti-Sesgo Docente (Sanitizador de CVs) ──
+  const [isRegexModalOpen, setIsRegexModalOpen] = useState(false);
+  const [regexFilterConfig, setRegexFilterConfig] = useState<RegexFilterConfig>(DEFAULT_REGEX_FILTER_CONFIG);
+
+  // Cargar configuración guardada de localStorage al iniciar
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("pradem_cv_regex_filter");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === "object") {
+          setRegexFilterConfig((prev) => ({ ...prev, ...parsed }));
+        }
+      }
+    } catch (e) {
+      console.warn("Error al cargar configuración regex de localStorage:", e);
+    }
+  }, []);
+
+  // Función de actualización y autoguardado en localStorage
+  const handleUpdateRegexFilterConfig = (newConfig: RegexFilterConfig) => {
+    setRegexFilterConfig(newConfig);
+    try {
+      localStorage.setItem("pradem_cv_regex_filter", JSON.stringify(newConfig));
+    } catch (e) {
+      console.warn("Error al guardar configuración regex en localStorage:", e);
+    }
+  };
 
   // ── Cargar conteo total de asignaturas del catálogo de Supabase ──
   useEffect(() => {
@@ -122,6 +199,221 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       setTopK(effectiveCatalogCount);
     }
   }, [effectiveCatalogCount, topK]);
+
+  // ── Cargar Clusters Disponibles desde Supabase o Filtro ──
+  const loadAvailableClusters = useCallback(async (colName: string) => {
+    setIsLoadingClusters(true);
+    try {
+      if (isFilterActive && filteredAsignaturas.length > 0) {
+        // Extraer de las asignaturas filtradas
+        const clustersSet = new Set<string>();
+        filteredAsignaturas.forEach((a) => {
+          const val = (a as any)[colName] || a.cluster;
+          if (val && String(val).trim()) {
+            clustersSet.add(String(val).trim());
+          }
+        });
+        setDetectedClusters(Array.from(clustersSet).sort());
+      } else {
+        // Consultar el endpoint de clusters
+        const data = await apiFetch<{
+          success: boolean;
+          availableColumns: string[];
+          clusters: string[];
+        }>(`/api/asignaturas/clusters?column=${encodeURIComponent(colName)}`);
+
+        if (data.success) {
+          if (Array.isArray(data.availableColumns) && data.availableColumns.length > 0) {
+            setAvailableClusterColumns(data.availableColumns);
+          }
+          if (Array.isArray(data.clusters)) {
+            setDetectedClusters(data.clusters);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("No se pudieron cargar clusters:", err);
+    } finally {
+      setIsLoadingClusters(false);
+    }
+  }, [isFilterActive, filteredAsignaturas]);
+
+  useEffect(() => {
+    loadAvailableClusters(clusterColumn);
+  }, [loadAvailableClusters, clusterColumn]);
+
+  const allClustersList = useMemo(() => {
+    const set = new Set([...detectedClusters, ...customClusters]);
+    return Array.from(set).sort();
+  }, [detectedClusters, customClusters]);
+
+  const activeFields = useMemo(() => {
+    return queryConfigs.filter((c) => c.active).map((c) => c.field);
+  }, [queryConfigs]);
+
+  // Asegurar que defaultBetas y cada cluster tengan valores válidos que sumen 100%
+  useEffect(() => {
+    if (!activeFields.length) return;
+
+    setDefaultBetas((prev) => {
+      const next = { ...prev };
+      let missingCount = 0;
+      activeFields.forEach((f) => {
+        if (typeof next[f] !== "number") missingCount++;
+      });
+
+      if (missingCount > 0 || Object.keys(next).length === 0) {
+        const totalW = activeFields.reduce((acc, f) => {
+          const cfg = queryConfigs.find((c) => c.field === f);
+          return acc + (cfg && cfg.weight > 0 ? cfg.weight : 0);
+        }, 0);
+
+        activeFields.forEach((f) => {
+          const cfg = queryConfigs.find((c) => c.field === f);
+          const w = cfg && cfg.weight > 0 ? cfg.weight : 1;
+          next[f] = totalW > 0 ? Math.round((w / totalW) * 100) : Math.round(100 / activeFields.length);
+        });
+      }
+      return next;
+    });
+
+    setClusterBetas((prev) => {
+      const next = { ...prev };
+      allClustersList.forEach((cluster) => {
+        if (!next[cluster]) {
+          next[cluster] = {};
+        }
+        activeFields.forEach((f) => {
+          if (typeof next[cluster][f] !== "number") {
+            const defVal = defaultBetas[f];
+            next[cluster][f] = typeof defVal === "number" ? defVal : Math.round(100 / activeFields.length);
+          }
+        });
+      });
+      return next;
+    });
+  }, [activeFields, allClustersList]);
+
+  // Actualizar un peso beta individual
+  const handleUpdateBeta = (clusterKey: string, field: string, value: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(value)));
+    if (clusterKey === "__default__") {
+      setDefaultBetas((prev) => ({ ...prev, [field]: clamped }));
+    } else {
+      setClusterBetas((prev) => ({
+        ...prev,
+        [clusterKey]: {
+          ...(prev[clusterKey] || {}),
+          [field]: clamped,
+        },
+      }));
+    }
+  };
+
+  // Normalizar los betas del cluster activo para que sumen exactamente 100%
+  const handleNormalizeBetas = (clusterKey: string) => {
+    const current = clusterKey === "__default__" ? defaultBetas : clusterBetas[clusterKey] || {};
+    const total = activeFields.reduce((acc, f) => acc + (current[f] || 0), 0);
+    if (total === 0) {
+      const eq = Math.round(100 / activeFields.length);
+      activeFields.forEach((f) => handleUpdateBeta(clusterKey, f, eq));
+      return;
+    }
+    const updated: Record<string, number> = {};
+    let running = 0;
+    activeFields.forEach((f, idx) => {
+      if (idx === activeFields.length - 1) {
+        updated[f] = Math.max(0, 100 - running);
+      } else {
+        const val = Math.round(((current[f] || 0) / total) * 100);
+        updated[f] = val;
+        running += val;
+      }
+    });
+
+    if (clusterKey === "__default__") {
+      setDefaultBetas(updated);
+    } else {
+      setClusterBetas((prev) => ({ ...prev, [clusterKey]: updated }));
+    }
+  };
+
+  // Distribuir equitativamente entre los campos activos
+  const handleEquiDistribute = (clusterKey: string) => {
+    const count = activeFields.length;
+    if (count === 0) return;
+    const base = Math.floor(100 / count);
+    const remainder = 100 - base * count;
+    const updated: Record<string, number> = {};
+    activeFields.forEach((f, idx) => {
+      updated[f] = idx === 0 ? base + remainder : base;
+    });
+
+    if (clusterKey === "__default__") {
+      setDefaultBetas(updated);
+    } else {
+      setClusterBetas((prev) => ({ ...prev, [clusterKey]: updated }));
+    }
+  };
+
+  // Copiar betas actuales a todos los clusters
+  const handleCopyBetasToAll = (sourceClusterKey: string) => {
+    const sourceBetas = sourceClusterKey === "__default__"
+      ? defaultBetas
+      : clusterBetas[sourceClusterKey] || defaultBetas;
+
+    setDefaultBetas({ ...sourceBetas });
+    const nextClusterBetas: Record<string, Record<string, number>> = {};
+    allClustersList.forEach((c) => {
+      nextClusterBetas[c] = { ...sourceBetas };
+    });
+    setClusterBetas(nextClusterBetas);
+  };
+
+  // Agregar cluster manual
+  const handleAddCustomCluster = () => {
+    const trimmed = newClusterName.trim();
+    if (!trimmed) return;
+    if (!allClustersList.includes(trimmed)) {
+      setCustomClusters((prev) => [...prev, trimmed]);
+      setClusterBetas((prev) => ({
+        ...prev,
+        [trimmed]: { ...defaultBetas },
+      }));
+    }
+    setSelectedClusterTab(trimmed);
+    setNewClusterName("");
+  };
+
+  // Estadísticas de validación de vectores en modo Solo Match
+  const validVectorStats = useMemo(() => {
+    if (importMode !== "only_match" || !fileRows.length) return null;
+    const activeConfigs = queryConfigs.filter((c) => c.active);
+    if (!activeConfigs.length) return null;
+
+    let fullyMappedProfessors = 0;
+    fileRows.forEach((row) => {
+      const hasAllFields = activeConfigs.every((c) => {
+        const col = c.embeddingColumn || `Embedding Profesor (${c.field})`;
+        const raw = row[col];
+        const vec = parseEmbeddingValue(raw);
+        return Array.isArray(vec) && vec.length === 768;
+      });
+
+      const singleRaw = row["Embedding Profesor"] || row["embedding_768"] || row["embedding"] || row["vector"];
+      const hasSingle = Array.isArray(parseEmbeddingValue(singleRaw));
+
+      if (hasAllFields || hasSingle) {
+        fullyMappedProfessors++;
+      }
+    });
+
+    return {
+      validCount: fullyMappedProfessors,
+      totalCount: fileRows.length,
+      percentage: Math.round((fullyMappedProfessors / fileRows.length) * 100),
+    };
+  }, [importMode, fileRows, queryConfigs]);
 
   // ── Procesamiento de Filtro de Claves (Limpieza Preliminar + Consulta) ──
   const processFilterColumn = async (rows: Record<string, string>[], colName: string) => {
@@ -249,6 +541,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       if (header === detectedNameCol) return;
 
       const norm = normalize(header);
+
+      // Omitir columnas que son vectores precalculados para no agregarlas como texto a buscar
+      if (
+        norm.startsWith("embedding") ||
+        norm.includes("embedding") ||
+        norm.includes("vector")
+      ) {
+        return;
+      }
+
       const isAcademic =
         norm.includes("acad") || norm.includes("estud") || norm.includes("grado") || norm.includes("formacion");
       const isLabor =
@@ -270,12 +572,32 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           "task: search result | query: Asignaturas y competencias técnicas afines a la experiencia laboral: {value}";
       }
 
+      // Auto-detectar si existe una columna de embedding en el archivo para este campo
+      const matchingEmbCol =
+        headers.find((h) => {
+          const hn = normalize(h);
+          return (
+            hn === `embeddingprofesor(${norm})` ||
+            hn === `embeddingprofesor${norm}` ||
+            hn === `embedding${norm}` ||
+            hn === `vector${norm}` ||
+            hn === `${norm}embedding` ||
+            hn === `${norm}vector`
+          );
+        }) ||
+        headers.find((h) => {
+          const hn = normalize(h);
+          return hn === "embeddingprofesor" || hn === "embedding768" || hn === "vector";
+        }) ||
+        "";
+
       configs.push({
         field: header,
         label: header,
         active: isRelevant,
         template: defaultTemplate,
         weight: isAcademic || isLabor ? 50 : 25,
+        embeddingColumn: matchingEmbCol,
       });
     });
 
@@ -360,19 +682,61 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
     setIsMatching(true);
     setMatchProgress(5);
-    setMatchStatusText("Iniciando matching multimodal con Gemini...");
+    setMatchStatusText(
+      importMode === "only_match"
+        ? "Iniciando matching directo con embeddings precalculados..."
+        : "Iniciando matching multimodal con Gemini..."
+    );
     setMatchResults([]);
 
     try {
-      // Formatear profesores
-      const profesoresList: Profesor[] = fileRows.map((row, idx) => ({
-        id: idx + 1,
-        nombre_profesor: (nameColumn ? row[nameColumn] : "") || `Profesor ${idx + 1}`,
-        ...row,
-      }));
+      // Formatear profesores e incorporar embeddings precalculados si está en modo Solo Match
+      const profesoresList: Profesor[] = fileRows.map((row, idx) => {
+        const prof: Profesor = {
+          id: idx + 1,
+          nombre_profesor: (nameColumn ? row[nameColumn] : "") || `Profesor ${idx + 1}`,
+          ...row,
+        };
 
-      // Procesar en lotes de 4 profesores para mantener al usuario informado
-      const BATCH_SIZE = 4;
+        if (importMode === "only_match") {
+          const fieldEmbeddings: Record<string, number[]> = {};
+          for (const config of activeConfigs) {
+            const col = config.embeddingColumn || `Embedding Profesor (${config.field})`;
+            const raw = row[col];
+            if (raw) {
+              const vec = parseEmbeddingValue(raw);
+              if (vec && vec.length === 768) {
+                fieldEmbeddings[config.field] = vec;
+              }
+            }
+          }
+          prof.fieldEmbeddings = fieldEmbeddings;
+
+          // Vector compuesto/único de respaldo si existe
+          const singleRaw =
+            row["Embedding Profesor"] ||
+            row["embedding_768"] ||
+            row["embedding"] ||
+            row["vector"];
+          if (singleRaw) {
+            const singleVec = parseEmbeddingValue(singleRaw);
+            if (singleVec && singleVec.length === 768) {
+              prof.embedding_768 = singleVec;
+              // Si no había vectores por campo, poblar con el vector único para permitir matching
+              activeConfigs.forEach((c) => {
+                if (!prof.fieldEmbeddings![c.field]) {
+                  prof.fieldEmbeddings![c.field] = singleVec;
+                }
+              });
+            }
+          }
+        }
+
+        return prof;
+      });
+
+      // Si es solo matching sin llamadas a Gemini, procesar en lotes de 20 para máxima velocidad
+      const BATCH_SIZE = importMode === "only_match" ? 20 : 4;
       const totalBatches = Math.ceil(profesoresList.length / BATCH_SIZE);
       const allResults: ProfesorMatchResult[] = [];
 
@@ -385,13 +749,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           ? ` sobre ${filteredAsignaturas.length} asignaturas filtradas`
           : "";
         setMatchStatusText(
-          `Procesando profesores ${start + 1} a ${end} de ${profesoresList.length}${filterSuffix}...`
+          importMode === "only_match"
+            ? `Calculando similitudes coseno para profesores ${start + 1} a ${end} de ${profesoresList.length}${filterSuffix}...`
+            : `Procesando profesores ${start + 1} a ${end} de ${profesoresList.length}${filterSuffix}...`
         );
         setMatchProgress(10 + Math.round(((b + 0.5) / totalBatches) * 85));
 
         const res = await apiFetch<{
           success: boolean;
           results?: ProfesorMatchResult[];
+          rateLimiterStats?: any;
           error?: string;
         }>("/api/match-profesores", {
           method: "POST",
@@ -402,6 +769,10 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             threshold: filterMode === "topK" ? 0.0 : threshold,
             topK: filterMode === "threshold" ? (effectiveCatalogCount || 500) : topK,
             filterAsignaturaIds: isFilterEffective ? filteredAsignaturas.map((a) => a.id) : undefined,
+            clusterColumn,
+            clusterBetas,
+            defaultBetas,
+            regexFilter: importMode === "generate" ? regexFilterConfig : undefined,
           }),
         });
 
@@ -410,6 +781,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         }
 
         allResults.push(...res.results);
+        if (res.rateLimiterStats) {
+          setRateLimiterStats(res.rateLimiterStats);
+        }
       }
 
       setMatchProgress(100);
@@ -427,6 +801,144 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       alert(`Error durante el matching: ${err.message || "Error desconocido"}`);
     } finally {
       setIsMatching(false);
+    }
+  };
+
+  // ── Generación Exclusiva de Embeddings de Profesores (Sin Matching) ──
+  const handleGenerateProfessorEmbeddingsOnly = async () => {
+    const activeConfigs = queryConfigs.filter((c) => c.active && c.weight > 0);
+    if (!activeConfigs.length) {
+      alert("Debes seleccionar y activar al menos un campo con peso > 0 para generar los embeddings.");
+      return;
+    }
+
+    if (!fileRows.length) {
+      alert("No hay registros de profesores para procesar.");
+      return;
+    }
+
+    setIsEmbeddingOnly(true);
+    setEmbedOnlyProgress(5);
+    setEmbedOnlyStatusText("Iniciando generación de embeddings de profesores con Gemini 2...");
+    setProfessorEmbeddingsList([]);
+
+    try {
+      const profesoresList: Profesor[] = fileRows.map((row, idx) => ({
+        id: idx + 1,
+        nombre_profesor: (nameColumn ? row[nameColumn] : "") || `Profesor ${idx + 1}`,
+        ...row,
+      }));
+
+      // Procesar en lotes de 15 profesores con el RateLimitManager
+      const BATCH_SIZE = 15;
+      const totalBatches = Math.ceil(profesoresList.length / BATCH_SIZE);
+      const allResults: ProfesorEmbeddingResult[] = [];
+
+      for (let b = 0; b < totalBatches; b++) {
+        const start = b * BATCH_SIZE;
+        const end = Math.min(start + BATCH_SIZE, profesoresList.length);
+        const batch = profesoresList.slice(start, end);
+
+        setEmbedOnlyStatusText(
+          `Generando embeddings para docentes ${start + 1} a ${end} de ${profesoresList.length} con Gemini 2...`
+        );
+        setEmbedOnlyProgress(10 + Math.round(((b + 0.5) / totalBatches) * 85));
+
+        const res = await apiFetch<{
+          success: boolean;
+          results?: ProfesorEmbeddingResult[];
+          rateLimiterStats?: any;
+          error?: string;
+        }>("/api/profesores/embed", {
+          method: "POST",
+          body: JSON.stringify({
+            profesores: batch,
+            queryConfigs: activeConfigs,
+            regexFilter: regexFilterConfig,
+          }),
+        });
+
+        if (!res.success || !res.results) {
+          throw new Error(res.error || `Error al procesar el lote ${b + 1} de embeddings.`);
+        }
+
+        allResults.push(...res.results);
+        if (res.rateLimiterStats) {
+          setRateLimiterStats(res.rateLimiterStats);
+        }
+      }
+
+      setEmbedOnlyProgress(100);
+      setEmbedOnlyStatusText("¡Embeddings de docentes generados exitosamente!");
+      setProfessorEmbeddingsList(allResults);
+
+      // Descargar automáticamente en Excel (.xlsx) por comodidad
+      exportProfessorEmbeddings(allResults, "excel");
+    } catch (err: any) {
+      console.error("Error generando embeddings de profesores:", err);
+      alert(`Error al generar embeddings: ${err.message || "Error desconocido"}`);
+    } finally {
+      setIsEmbeddingOnly(false);
+    }
+  };
+
+  const exportProfessorEmbeddings = (
+    items: ProfesorEmbeddingResult[],
+    format: "excel" | "csv"
+  ) => {
+    if (!items.length) return;
+
+    const rows = items.map((item) => {
+      const rowData: Record<string, any> = {
+        "ID Profesor": item.profesor.id,
+        "Nombre Profesor": item.profesor.nombre_profesor,
+      };
+
+      fileHeaders.forEach((h) => {
+        if (h !== nameColumn) {
+          let val = item.profesor[h] ?? "";
+          if (
+            item.sanitizationStatus === "sanitized" &&
+            typeof val === "string" &&
+            regexFilterConfig?.enabled
+          ) {
+            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+            val = res.sanitizedText;
+          }
+          rowData[h] = val;
+        }
+      });
+
+      // Embedding 768d global/compuesto del profesor
+      rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+
+      // Estado del filtro anti-sesgo
+      if (item.sanitizationStatus) {
+        rowData["Filtro Anti-Sesgo"] =
+          item.sanitizationStatus === "intact"
+            ? "Intacto (Credencial pedagógica)"
+            : item.sanitizationStatus === "sanitized"
+            ? "Sanitizado (Sesgo mitigado)"
+            : "Inactivo";
+      }
+
+      // Embeddings por cada criterio evaluado
+      if (item.fieldEmbeddings) {
+        Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
+          const cfg = queryConfigs.find((c) => c.field === field);
+          const label = cfg ? cfg.label : field;
+          rowData[`Embedding Profesor (${label})`] = formatEmbeddingForExport(vec);
+        });
+      }
+
+      return rowData;
+    });
+
+    const filename = `Embeddings_Profesores_Gemini2_${new Date().toISOString().slice(0, 10)}`;
+    if (format === "excel") {
+      exportToExcel(rows, filename);
+    } else {
+      exportToCsv(rows, filename);
     }
   };
 
@@ -498,7 +1010,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     });
   }, [matchResults, filterOnlyWithMatches, searchFilter]);
 
-  // ── Exportación a Excel (.xlsx) y CSV ──
+  // ── Exportación a Excel (.xlsx) y CSV con Embeddings (Profesor y Asignatura) ──
   const handleExport = (format: "excel" | "csv") => {
     if (!matchResults.length) return;
 
@@ -509,14 +1021,45 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         "Nombre Profesor": item.profesor.nombre_profesor,
       };
 
-      // Incluir campos originales del profesor
+      // Incluir campos del profesor (versión sanitizada si se mitigó el sesgo)
       fileHeaders.forEach((h) => {
         if (h !== nameColumn) {
-          rowData[h] = item.profesor[h] || "";
+          let val = item.profesor[h] ?? "";
+          if (
+            item.sanitizationStatus === "sanitized" &&
+            typeof val === "string" &&
+            regexFilterConfig?.enabled
+          ) {
+            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+            val = res.sanitizedText;
+          }
+          rowData[h] = val;
         }
       });
 
+      // Embedding 768d del Profesor (Vector compuesto multimodal)
+      rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+
+      // Embeddings específicos por criterio evaluado si existen
+      if (item.fieldEmbeddings) {
+        Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
+          const cfg = queryConfigs.find((c) => c.field === field);
+          const label = cfg ? cfg.label : field;
+          rowData[`Embedding Profesor (${label})`] = formatEmbeddingForExport(vec);
+        });
+      }
+
       rowData["Asignaturas Asignadas"] = item.matches.length;
+
+      // Estado del filtro anti-sesgo
+      if (item.sanitizationStatus) {
+        rowData["Filtro Anti-Sesgo"] =
+          item.sanitizationStatus === "intact"
+            ? "Intacto (Credencial pedagógica)"
+            : item.sanitizationStatus === "sanitized"
+            ? "Sanitizado (Sesgo mitigado)"
+            : "Inactivo";
+      }
 
       // Determinar cuántas columnas de match exportar
       const maxMatchesToExport = Math.max(
@@ -533,6 +1076,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         if (m) {
           rowData[`${prefix} - Asignatura`] = m.nombre;
           rowData[`${prefix} - Clave`] = m.clave;
+          rowData[`${prefix} - Cluster`] = m.cluster || "Sin Cluster";
           rowData[`${prefix} - Tipo`] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
           rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
 
@@ -541,18 +1085,23 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
             .join(" | ");
           rowData[`${prefix} - Desglose`] = desglose;
+
+          // Embedding 768d de la Asignatura recomendada
+          rowData[`${prefix} - Embedding Asignatura`] = formatEmbeddingForExport(m.embedding_768);
         } else {
           rowData[`${prefix} - Asignatura`] = "—";
           rowData[`${prefix} - Clave`] = "—";
+          rowData[`${prefix} - Cluster`] = "—";
           rowData[`${prefix} - Similitud Compuesta`] = "—";
           rowData[`${prefix} - Desglose`] = "—";
+          rowData[`${prefix} - Embedding Asignatura`] = "—";
         }
       }
 
       return rowData;
     });
 
-    const filename = `Match_Profesores_Asignaturas_${new Date().toISOString().slice(0, 10)}`;
+    const filename = `Match_Profesores_Asignaturas_con_Embeddings_${new Date().toISOString().slice(0, 10)}`;
     if (format === "excel") {
       exportToExcel(rows, filename);
     } else {
@@ -953,27 +1502,148 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             </div>
           </div>
 
-          {file && (
-            <div className="flex items-center gap-2">
-              <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/30 px-3 py-1 text-xs font-semibold text-emerald-300">
-                {fileRows.length} docentes cargados
-              </span>
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Selector de Modo de Procesamiento */}
+            <div className="flex items-center rounded-xl border border-white/10 bg-slate-950 p-1 text-xs">
               <button
                 type="button"
-                onClick={() => {
-                  setFile(null);
-                  setFileRows([]);
-                  setFileHeaders([]);
-                  setQueryConfigs([]);
-                  setMatchResults([]);
-                }}
-                className="text-xs text-slate-400 hover:text-white underline"
+                onClick={() => setImportMode("generate")}
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold transition cursor-pointer ${
+                  importMode === "generate"
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-white"
+                }`}
               >
-                Cambiar archivo
+                <Sparkles className="h-3.5 w-3.5" />
+                <span>Con Gemini 2</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setImportMode("only_match")}
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold transition cursor-pointer ${
+                  importMode === "only_match"
+                    ? "bg-cyan-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                <Cpu className="h-3.5 w-3.5" />
+                <span>Solo Match (Con Embeddings)</span>
               </button>
             </div>
-          )}
+
+            {file && (
+              <div className="flex items-center gap-2">
+                <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/30 px-3 py-1 text-xs font-semibold text-emerald-300">
+                  {fileRows.length} docentes cargados
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFile(null);
+                    setFileRows([]);
+                    setFileHeaders([]);
+                    setQueryConfigs([]);
+                    setMatchResults([]);
+                  }}
+                  className="text-xs text-slate-400 hover:text-white underline cursor-pointer"
+                >
+                  Cambiar archivo
+                </button>
+              </div>
+            )}
+          </div>
         </div>
+
+        {/* Banner Informativo cuando Solo Match está activo */}
+        {importMode === "only_match" && (
+          <div className="flex items-start gap-3 rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-4 text-xs text-cyan-200 animate-in fade-in">
+            <Cpu className="h-5 w-5 text-cyan-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h4 className="font-bold text-white text-xs">
+                  Modo "Solo Match" Activo — Sin llamadas a la API de Gemini
+                </h4>
+                {validVectorStats && (
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold border ${
+                      validVectorStats.percentage === 100
+                        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                        : "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                    }`}
+                  >
+                    {validVectorStats.validCount} de {validVectorStats.totalCount} profesores con vectores listos ({validVectorStats.percentage}%)
+                  </span>
+                )}
+              </div>
+              <p className="text-cyan-200/90 leading-relaxed text-[11px]">
+                Este modo utiliza los vectores de 768 dimensiones incluidos en tu archivo (ej. columnas exportadas previamente como <em>Embedding Profesor</em>). No se consumirá cuota de tokens ni se requiere conexión con Gemini.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Banner de Control del Filtro Regex Anti-Sesgo cuando importMode === "generate" */}
+        {importMode === "generate" && (
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-indigo-500/30 bg-gradient-to-r from-indigo-950/40 via-purple-950/20 to-slate-900/60 p-4 text-xs animate-in fade-in shadow-sm">
+            <div className="flex items-center gap-3">
+              <div className="rounded-xl bg-indigo-500/20 p-2.5 text-indigo-300 border border-indigo-500/30">
+                <ShieldCheck className="h-5 w-5" />
+              </div>
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <h4 className="font-bold text-white text-xs">
+                    Filtro Regex Anti-Sesgo Docente
+                  </h4>
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-[10px] font-bold border transition ${
+                      regexFilterConfig.enabled
+                        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                        : "bg-slate-700/50 text-slate-400 border-slate-600/40"
+                    }`}
+                  >
+                    {regexFilterConfig.enabled ? "FILTRO ACTIVO" : "INACTIVO"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 max-w-xl">
+                  {regexFilterConfig.enabled
+                    ? "Preserva perfiles con credenciales oficiales en educación; enmascara términos detonantes de experiencia en perfiles no pedagógicos."
+                    : "Desactivado: se generarán embeddings directamente sobre el texto original sin sanitización."}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() =>
+                  handleUpdateRegexFilterConfig({
+                    ...regexFilterConfig,
+                    enabled: !regexFilterConfig.enabled,
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                  regexFilterConfig.enabled ? "bg-indigo-600" : "bg-slate-700"
+                }`}
+                title={regexFilterConfig.enabled ? "Desactivar filtro regex" : "Activar filtro regex"}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                    regexFilterConfig.enabled ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsRegexModalOpen(true)}
+                className="flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1.5 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 transition cursor-pointer"
+              >
+                <Sliders className="h-3.5 w-3.5" />
+                <span>Configurar y Probar Regex</span>
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Zona Drag & Drop si no hay archivo */}
         {!file ? (
@@ -1174,11 +1844,271 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                           className="w-full accent-indigo-500 cursor-pointer"
                         />
                       </div>
+                      {/* Vinculación de Columna de Vector (Solo Match) */}
+                      {importMode === "only_match" && (
+                        <div className="lg:col-span-12 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-cyan-500/20 bg-cyan-500/[0.03] p-2.5 rounded-lg">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-semibold text-cyan-300 flex items-center gap-1.5">
+                              <Cpu className="h-3.5 w-3.5 text-cyan-400" />
+                              Columna del archivo con el vector (768d) para este campo:
+                            </span>
+                            <select
+                              value={config.embeddingColumn || ""}
+                              onChange={(e) => updateConfig(config.field, { embeddingColumn: e.target.value })}
+                              className="rounded-lg border border-cyan-500/30 bg-slate-900 px-3 py-1 text-xs text-cyan-200 font-mono font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                            >
+                              <option value="">-- Seleccionar columna con vector --</option>
+                              {fileHeaders.map((h) => (
+                                <option key={h} value={h}>
+                                  {h}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          {config.embeddingColumn ? (
+                            <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-300 font-mono">
+                              <Check className="h-3 w-3" />
+                              Columna vinculada: {config.embeddingColumn}
+                            </span>
+                          ) : (
+                            <span className="text-[11px] text-amber-300 font-mono">
+                              ⚠️ Selecciona la columna del archivo que contiene el embedding de este campo
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
               );
             })}
+          </div>
+
+          {/* ── SECCIÓN DE CONFIGURACIÓN DE CLUSTERS Y BETAS ── */}
+          <div className="rounded-xl border border-cyan-500/30 bg-slate-950/90 p-5 space-y-5 shadow-lg shadow-cyan-500/5">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="rounded-md bg-cyan-500/20 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-cyan-300 flex items-center gap-1">
+                    <Tag className="h-3 w-3" />
+                    Ponderación por Cluster
+                  </span>
+                  <h4 className="text-sm font-bold text-white tracking-tight">
+                    Configuración General de Cluster y Betas (&beta;)
+                  </h4>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Introduce los coeficientes Beta (%) que ponderan cada campo docente según el cluster al que pertenezca la asignatura.
+                </p>
+              </div>
+
+              {/* Selector de Columna de Cluster */}
+              <div className="flex items-center gap-2 bg-slate-900 border border-white/10 rounded-xl px-3 py-1.5 text-xs">
+                <span className="text-slate-400 font-medium">Columna de Cluster:</span>
+                <select
+                  value={clusterColumn}
+                  onChange={(e) => setClusterColumn(e.target.value)}
+                  className="rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                >
+                  {availableClusterColumns.map((col) => (
+                    <option key={col} value={col}>
+                      {col} {col === "cluster" ? "(Por defecto)" : ""}
+                    </option>
+                  ))}
+                </select>
+                {isLoadingClusters && <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />}
+              </div>
+            </div>
+
+            {/* Pestañas de Clusters Detectados + Default */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span>Selecciona un cluster para ajustar sus coeficientes Beta:</span>
+                <span className="font-mono text-[11px] text-cyan-300">
+                  {allClustersList.length} clusters disponibles + 1 General
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Pestaña Fallback / General */}
+                <button
+                  type="button"
+                  onClick={() => setSelectedClusterTab("__default__")}
+                  className={`flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
+                    selectedClusterTab === "__default__"
+                      ? "border-cyan-400 bg-cyan-500/20 text-white shadow-md shadow-cyan-500/20 ring-1 ring-cyan-400"
+                      : "border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
+                  }`}
+                >
+                  <span>⚙️ General / Sin Cluster</span>
+                  <span className="rounded bg-black/40 px-1.5 py-0.2 text-[10px] font-mono text-cyan-300">
+                    Fallback
+                  </span>
+                </button>
+
+                {/* Pestañas de clusters detectados */}
+                {allClustersList.map((cName) => {
+                  const isSelected = selectedClusterTab === cName;
+                  return (
+                    <button
+                      key={cName}
+                      type="button"
+                      onClick={() => setSelectedClusterTab(cName)}
+                      className={`flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
+                        isSelected
+                          ? "border-indigo-400 bg-indigo-500/25 text-white shadow-md shadow-indigo-500/20 ring-1 ring-indigo-400"
+                          : "border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
+                      }`}
+                    >
+                      <Tag className="h-3 w-3 text-indigo-400" />
+                      <span>{cName}</span>
+                    </button>
+                  );
+                })}
+
+                {/* Input para agregar cluster manual */}
+                <div className="flex items-center gap-1.5 rounded-xl border border-dashed border-white/20 bg-slate-900/60 px-2 py-1">
+                  <input
+                    type="text"
+                    placeholder="Nuevo cluster..."
+                    value={newClusterName}
+                    onChange={(e) => setNewClusterName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddCustomCluster();
+                      }
+                    }}
+                    className="w-28 bg-transparent px-1.5 py-0.5 text-xs text-white placeholder-slate-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddCustomCluster}
+                    disabled={!newClusterName.trim()}
+                    className="rounded-lg bg-indigo-600/50 hover:bg-indigo-600 p-1 text-white disabled:opacity-30 transition cursor-pointer"
+                    title="Agregar cluster manualmente"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Editor de Betas para la Pestaña Activa */}
+            {activeFields.length === 0 ? (
+              <div className="rounded-lg border border-white/5 bg-slate-900/40 p-4 text-center text-xs text-slate-400">
+                Activa al menos un campo en el constructor de queries arriba para configurar sus Betas.
+              </div>
+            ) : (
+              <div className="rounded-xl border border-white/10 bg-slate-900/70 p-4 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-white">
+                      Coeficientes Beta (&beta;) para:
+                    </span>
+                    <span className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 text-xs font-mono font-bold text-indigo-300">
+                      {selectedClusterTab === "__default__" ? "General / Sin Cluster" : selectedClusterTab}
+                    </span>
+                  </div>
+
+                  {/* Métrica de Suma Total */}
+                  {(() => {
+                    const currentBetas = selectedClusterTab === "__default__" ? defaultBetas : clusterBetas[selectedClusterTab] || {};
+                    const currentTotal = activeFields.reduce((acc, f) => acc + (currentBetas[f] || 0), 0);
+                    const isHundred = currentTotal === 100;
+
+                    return (
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs text-slate-400">Suma de Betas:</span>
+                        <span className={`rounded-lg px-2.5 py-0.5 font-mono font-bold text-xs border ${
+                          isHundred
+                            ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                            : "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                        }`}>
+                          {currentTotal}% {isHundred ? "✓" : "(Se normalizará a 100%)"}
+                        </span>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* Sliders de cada campo para este cluster */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {activeFields.map((field) => {
+                    const cfg = queryConfigs.find((c) => c.field === field);
+                    const label = cfg?.label || field;
+                    const currentBetas = selectedClusterTab === "__default__" ? defaultBetas : clusterBetas[selectedClusterTab] || {};
+                    const val = typeof currentBetas[field] === "number" ? currentBetas[field] : 0;
+
+                    return (
+                      <div key={field} className="rounded-lg border border-white/5 bg-slate-950/60 p-3 space-y-2">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-semibold text-white truncate max-w-[200px]" title={label}>
+                            {label}
+                          </span>
+                          <div className="flex items-center gap-1.5 font-mono">
+                            <input
+                              type="number"
+                              min="0"
+                              max="100"
+                              value={val}
+                              onChange={(e) => handleUpdateBeta(selectedClusterTab, field, parseFloat(e.target.value) || 0)}
+                              className="w-16 rounded-md border border-white/15 bg-slate-900 px-1.5 py-0.5 text-center text-xs font-bold text-cyan-300 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                            />
+                            <span className="text-slate-400 text-xs">%</span>
+                          </div>
+                        </div>
+
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="1"
+                          value={val}
+                          onChange={(e) => handleUpdateBeta(selectedClusterTab, field, parseFloat(e.target.value))}
+                          className="w-full accent-cyan-500 cursor-pointer"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Acciones Rápidas */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-white/10 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleNormalizeBetas(selectedClusterTab)}
+                      className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-emerald-300 hover:bg-emerald-500/20 transition cursor-pointer font-medium"
+                      title="Ajusta proporcionalmente los valores para que sumen exactamente 100%"
+                    >
+                      <Equal className="h-3.5 w-3.5" />
+                      <span>Auto-normalizar a 100%</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleEquiDistribute(selectedClusterTab)}
+                      className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-slate-300 hover:text-white hover:bg-white/10 transition cursor-pointer"
+                      title="Distribuye porcentajes iguales entre todos los campos activos"
+                    >
+                      <Sliders className="h-3.5 w-3.5" />
+                      <span>Distribuir equitativamente</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleCopyBetasToAll(selectedClusterTab)}
+                    className="flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-1.5 text-indigo-300 hover:bg-indigo-500/20 transition cursor-pointer font-medium"
+                    title="Aplica la configuración de betas de este cluster a todos los demás clusters"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    <span>Copiar a todos los clusters</span>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Selector de Modo de Filtrado: Threshold O Número de Asignaturas O Ambos */}
@@ -1408,45 +2338,121 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
           {/* Botón de Ejecución Principal */}
           <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-5">
-            <p className="text-xs text-slate-400 max-w-md">
-              {isFilterEffective ? (
-                <>
-                  Genera embeddings multimodales con Gemini 2 y corre la matriz de distancias{" "}
-                  <strong className="text-emerald-300 font-semibold">
-                    exclusivamente en las {filteredAsignaturas.length} asignaturas filtradas
-                  </strong>.
-                </>
-              ) : (
-                <>
-                  Genera los embeddings multimodales con Gemini 2 para cada docente y consulta la función RPC <code className="font-mono text-indigo-300">match_asignaturas_cosine</code> en Supabase sobre el catálogo completo.
-                </>
+            <div className="space-y-1 max-w-md">
+              <p className="text-xs text-slate-400">
+                {importMode === "only_match" ? (
+                  <>
+                    Utiliza los vectores de 768 dimensiones precalculados del archivo sin invocar a Gemini, aplicando los coeficientes Betas (&beta;) según el cluster de cada asignatura{" "}
+                    {isFilterEffective && (
+                      <strong className="text-emerald-300 font-semibold">
+                        exclusivamente sobre las {filteredAsignaturas.length} asignaturas filtradas
+                      </strong>
+                    )}.
+                  </>
+                ) : isFilterEffective ? (
+                  <>
+                    Genera embeddings multimodales con Gemini 2 y corre la matriz de distancias{" "}
+                    <strong className="text-emerald-300 font-semibold">
+                      exclusivamente en las {filteredAsignaturas.length} asignaturas filtradas
+                    </strong>.
+                  </>
+                ) : (
+                  <>
+                    Genera los embeddings multimodales con Gemini 2 para cada docente y consulta la función RPC <code className="font-mono text-indigo-300">match_asignaturas_cosine</code> en Supabase sobre el catálogo completo.
+                  </>
+                )}
+              </p>
+              {importMode === "generate" && (
+                <div className="flex items-center gap-2 pt-0.5 text-[11px]">
+                  <span className="text-slate-500">Filtro Regex:</span>
+                  <button
+                    type="button"
+                    onClick={() => setIsRegexModalOpen(true)}
+                    className={`inline-flex items-center gap-1 font-semibold underline cursor-pointer transition ${
+                      regexFilterConfig.enabled ? "text-emerald-400 hover:text-emerald-300" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                    <span>{regexFilterConfig.enabled ? "Anti-Sesgo Activo" : "Inactivo"} (Editar)</span>
+                  </button>
+                </div>
               )}
-            </p>
+            </div>
 
-            <button
-              type="button"
-              disabled={isMatching || totalActiveWeight === 0}
-              onClick={handleRunMatching}
-              className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-600 bg-size-200 px-6 py-3 text-xs font-bold text-white shadow-lg shadow-indigo-600/30 hover:opacity-95 disabled:opacity-50 transition"
-            >
-              {isMatching ? (
-                <>
-                  <RefreshCw className="h-4 w-4 animate-spin" />
-                  <span>Calculando Matching ({matchProgress}%)...</span>
-                </>
-              ) : (
-                <>
-                  <Sparkles className="h-4 w-4" />
-                  <span>
-                    Ejecutar Matching Inteligente{" "}
-                    {isFilterEffective ? `(${filteredAsignaturas.length} Filtradas)` : "(Catálogo Completo)"}
-                  </span>
-                </>
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Opción 1: Solo Generar y Descargar Embeddings de Profesores (solo si importMode === 'generate') */}
+              {importMode === "generate" && (
+                <button
+                  type="button"
+                  disabled={isMatching || isEmbeddingOnly || totalActiveWeight === 0}
+                  onClick={handleGenerateProfessorEmbeddingsOnly}
+                  className="flex items-center gap-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-5 py-3 text-xs font-bold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50 transition cursor-pointer shadow-md shadow-cyan-500/10"
+                  title="Genera exclusivamente los vectores de 768 dimensiones de los docentes y los descarga inmediatamente en Excel/CSV sin ejecutar matching"
+                >
+                  {isEmbeddingOnly ? (
+                    <>
+                      <RefreshCw className="h-4 w-4 animate-spin text-cyan-300" />
+                      <span>Generando Embeddings ({embedOnlyProgress}%)...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Cpu className="h-4 w-4 text-cyan-400" />
+                      <span>Solo Generar y Descargar Embeddings Docentes</span>
+                    </>
+                  )}
+                </button>
               )}
-            </button>
+
+              {/* Opción 2: Ejecutar Matching */}
+              <button
+                type="button"
+                disabled={isMatching || isEmbeddingOnly || totalActiveWeight === 0}
+                onClick={handleRunMatching}
+                className={`flex items-center gap-2 rounded-xl px-6 py-3 text-xs font-bold text-white shadow-lg transition cursor-pointer disabled:opacity-50 ${
+                  importMode === "only_match"
+                    ? "bg-gradient-to-r from-cyan-600 via-indigo-600 to-cyan-600 shadow-cyan-600/30 hover:opacity-95"
+                    : "bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-600 bg-size-200 shadow-indigo-600/30 hover:opacity-95"
+                }`}
+              >
+                {isMatching ? (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    <span>Calculando Matching ({matchProgress}%)...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-4 w-4" />
+                    <span>
+                      {importMode === "only_match"
+                        ? `Ejecutar Solo Matching (Embeddings Precalculados ${isFilterEffective ? `- ${filteredAsignaturas.length} Filtradas` : ""})`
+                        : `Ejecutar Matching Inteligente ${isFilterEffective ? `(${filteredAsignaturas.length} Filtradas)` : "(Catálogo Completo)"}`}
+                    </span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
-          {/* Barra de Progreso */}
+          {/* Barra de Progreso de Solo Embeddings */}
+          {isEmbeddingOnly && (
+            <div className="space-y-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-4 animate-in fade-in">
+              <div className="flex items-center justify-between text-xs font-medium text-cyan-200">
+                <span className="flex items-center gap-2">
+                  <Cpu className="h-4 w-4 text-cyan-400 animate-pulse" />
+                  <span>{embedOnlyStatusText}</span>
+                </span>
+                <span className="font-mono font-bold">{embedOnlyProgress}%</span>
+              </div>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-900">
+                <div
+                  className="h-full bg-gradient-to-r from-cyan-500 via-indigo-500 to-emerald-400 transition-all duration-300"
+                  style={{ width: `${embedOnlyProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Barra de Progreso de Matching */}
           {isMatching && (
             <div className="space-y-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4 animate-in fade-in">
               <div className="flex items-center justify-between text-xs font-medium text-indigo-200">
@@ -1461,6 +2467,117 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── SECCIÓN DE RESULTADOS DE SOLO EMBEDDINGS DOCENTES ── */}
+      {professorEmbeddingsList.length > 0 && (
+        <div className="rounded-2xl border border-cyan-500/30 bg-slate-900/80 p-6 backdrop-blur-sm shadow-xl space-y-5 animate-in fade-in">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="rounded-md bg-cyan-500/20 border border-cyan-500/30 px-2.5 py-0.5 text-[10px] font-bold tracking-wider uppercase text-cyan-300 flex items-center gap-1.5">
+                  <Cpu className="h-3 w-3" />
+                  Embeddings de Docentes Generados
+                </span>
+                <span className="text-xs text-slate-400 font-mono">
+                  {professorEmbeddingsList.length} docentes procesados
+                </span>
+              </div>
+              <h3 className="text-lg font-bold text-white mt-1">
+                Vectores Multimodales de 768 Dimensiones Listos
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Los embeddings de cada profesor han sido calculados con Gemini 2 mediante el RateLimitManager (3,000 RPM / 1M TPM) y descargados directamente en Excel/CSV.
+              </p>
+            </div>
+
+            {/* Botones de Descarga */}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => exportProfessorEmbeddings(professorEmbeddingsList, "excel")}
+                className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20 transition shadow-sm cursor-pointer"
+                title="Descargar archivo Excel con los vectores 768d de los profesores"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>Descargar Excel (.xlsx)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => exportProfessorEmbeddings(professorEmbeddingsList, "csv")}
+                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-xs font-semibold text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
+                title="Descargar archivo CSV con los vectores 768d"
+              >
+                <FileText className="h-3.5 w-3.5" />
+                <span>Descargar CSV</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Tabla de Previsualización de Profesores y Vectores */}
+          <div className="overflow-x-auto rounded-xl border border-white/10 bg-slate-950/60">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-900/90 text-slate-400 border-b border-white/10">
+                <tr>
+                  <th className="py-2.5 px-3 font-semibold">#</th>
+                  <th className="py-2.5 px-3 font-semibold">Nombre del Docente</th>
+                  <th className="py-2.5 px-3 font-semibold">Filtro Anti-Sesgo</th>
+                  <th className="py-2.5 px-3 font-semibold">Criterios Evaluados</th>
+                  <th className="py-2.5 px-3 font-semibold">Vector Compuesto (768d)</th>
+                  <th className="py-2.5 px-3 font-semibold text-right">Estado</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {professorEmbeddingsList.slice(0, 10).map((item, idx) => {
+                  const fields = Object.keys(item.fieldEmbeddings || {});
+                  return (
+                    <tr key={item.id} className="hover:bg-white/[0.02]">
+                      <td className="py-2 px-3 font-mono text-slate-400">{idx + 1}</td>
+                      <td className="py-2 px-3 font-semibold text-white">{item.nombre_profesor}</td>
+                      <td className="py-2 px-3">
+                        {item.sanitizationStatus === "intact" ? (
+                          <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 px-1.5 py-0.5 text-[10px] font-semibold">
+                            Credencial Verificada
+                          </span>
+                        ) : item.sanitizationStatus === "sanitized" ? (
+                          <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 text-[10px] font-semibold">
+                            Sesgo Mitigado
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-slate-500 font-mono">Sin filtro</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3">
+                        <div className="flex flex-wrap gap-1">
+                          {fields.map((f) => (
+                            <span key={f} className="rounded bg-indigo-500/15 text-indigo-300 px-1.5 py-0.5 text-[10px] font-mono">
+                              {f}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="py-2 px-3 font-mono text-[11px] text-cyan-300">
+                        {item.embedding_768 ? `768 floats [${item.embedding_768.slice(0, 3).map(n => n.toFixed(3)).join(", ")}...]` : "—"}
+                      </td>
+                      <td className="py-2 px-3 text-right">
+                        <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-2 py-0.5 text-[10px] font-mono">
+                          <Check className="h-2.5 w-2.5" />
+                          <span>Generado</span>
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            {professorEmbeddingsList.length > 10 && (
+              <div className="p-2.5 text-center text-xs text-slate-400 bg-slate-900/50 border-t border-white/5">
+                Mostrando 10 de {professorEmbeddingsList.length} profesores. Descarga el archivo completo en Excel o CSV para ver todos los vectores.
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1504,7 +2621,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               <button
                 type="button"
                 onClick={() => handleExport("excel")}
-                className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20 transition shadow-sm"
+                className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20 transition shadow-sm cursor-pointer"
+                title="Descargar matriz con embeddings 768d de profesores y asignaturas (.xlsx)"
               >
                 <Download className="h-3.5 w-3.5" />
                 <span>Exportar Excel (.xlsx)</span>
@@ -1513,11 +2631,39 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               <button
                 type="button"
                 onClick={() => handleExport("csv")}
-                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3.5 py-2 text-xs font-semibold text-slate-300 hover:bg-white/10 hover:text-white transition"
+                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3.5 py-2 text-xs font-semibold text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
+                title="Descargar archivo CSV con vectores de 768 dimensiones (.csv)"
               >
                 <FileText className="h-3.5 w-3.5" />
                 <span>Exportar CSV</span>
               </button>
+            </div>
+          </div>
+
+          {/* Banner de Embeddings Descargables & Rate Limiter Gemini 2 */}
+          <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04] p-3 text-xs flex flex-wrap items-center justify-between gap-3 shadow-inner">
+            <div className="flex items-center gap-2.5 text-slate-300">
+              <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-emerald-500/20 text-emerald-400">
+                <ShieldCheck className="h-4 w-4" />
+              </div>
+              <div>
+                <span className="font-semibold text-white">Embeddings 768d incluidos en la descarga:</span>{" "}
+                <span className="text-slate-400">
+                  Los archivos XLSX y CSV exportan el vector de cada profesor y el vector de cada asignatura asignada.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 bg-slate-950/80 px-3 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-300 font-mono">
+              <Cpu className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+              <span>
+                Rate Limiter: <strong className="text-cyan-300">3,000 RPM</strong> | <strong className="text-indigo-300">1,000,000 TPM</strong>
+              </span>
+              {rateLimiterStats && (
+                <span className="ml-1 text-[10px] text-emerald-400 font-semibold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                  Activo
+                </span>
+              )}
             </div>
           </div>
 
@@ -1638,6 +2784,22 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                             <span className="text-[10px] text-slate-500 font-mono">
                               ID: {profId}
                             </span>
+                            {result.sanitizationStatus === "intact" && (
+                              <span
+                                className="rounded px-1.5 py-0.5 text-[9px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                                title="Cuenta con credencial formal en educación/pedagogía comprobada"
+                              >
+                                Credencial Verificada
+                              </span>
+                            )}
+                            {result.sanitizationStatus === "sanitized" && (
+                              <span
+                                className="rounded px-1.5 py-0.5 text-[9px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                                title="Sesgo de experiencia neutralizado para evaluación objetiva"
+                              >
+                                Sesgo Mitigado
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-2 mt-0.5 text-[11px] text-slate-400">
                             <span>
@@ -1650,6 +2812,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                       </div>
 
                       <div className="flex items-center gap-3">
+                        {result.embedding_768 && (
+                          <span
+                            className="hidden sm:inline-flex items-center gap-1 rounded-md bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 text-[10px] text-indigo-300 font-mono"
+                            title="Vector multimodal 768d generado y disponible para descarga"
+                          >
+                            <Cpu className="h-2.5 w-2.5" />
+                            <span>Emb 768d</span>
+                          </span>
+                        )}
+
                         {hasMatches ? (
                           <div
                             className={`flex items-center gap-1.5 rounded-xl border px-3 py-1 text-xs font-bold font-mono ${scoreColor}`}
@@ -1788,10 +2960,27 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                           {matchItem.clave}
                                         </span>
                                       )}
+                                      {matchItem.cluster && (
+                                        <span
+                                          className="rounded-md bg-cyan-500/15 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-mono text-cyan-200 flex items-center gap-1 font-semibold"
+                                          title={`Cluster de la asignatura: ${matchItem.cluster}`}
+                                        >
+                                          <Tag className="h-2.5 w-2.5 text-cyan-400" />
+                                          <span>{matchItem.cluster}</span>
+                                        </span>
+                                      )}
                                       {matchItem.match_nombre && (
                                         <span className="rounded-md bg-purple-500/20 text-purple-300 border border-purple-500/40 px-2 py-0.5 text-[10px] font-semibold flex items-center gap-1">
                                           <span>🎯 Match Nombre</span>
                                           <span className="text-[9px] text-purple-200/80 font-normal">(Exento de cupo Top K)</span>
+                                        </span>
+                                      )}
+                                      {matchItem.embedding_768 && (
+                                        <span
+                                          className="hidden sm:inline-flex items-center gap-1 rounded-md bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300 font-mono"
+                                          title="Vector 768d disponible y descargable"
+                                        >
+                                          Vector 768d
                                         </span>
                                       )}
                                     </div>
@@ -1849,6 +3038,19 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           </div>
         </div>
       )}
+
+      {/* Modal de Configuración y Prueba del Filtro Regex Anti-Sesgo */}
+      <RegexFilterModal
+        isOpen={isRegexModalOpen}
+        onClose={() => setIsRegexModalOpen(false)}
+        config={regexFilterConfig}
+        onChangeConfig={handleUpdateRegexFilterConfig}
+        profesores={fileRows.map((r, i) => ({
+          id: i + 1,
+          nombre_profesor: (nameColumn ? r[nameColumn] : "") || `Profesor ${i + 1}`,
+          ...r,
+        }))}
+      />
     </div>
   );
 }

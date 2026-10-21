@@ -255,3 +255,16 @@ export function exportToCsv(data: Record<string, any>[], filename: string) {
   link.click();
   document.body.removeChild(link);
 }
+
+/**
+ * Formatea un vector de embedding (768 dimensiones) para su exportación limpia en CSV y Excel (.xlsx).
+ * Redondea los valores a 6 decimales para mantener una precisión del 99.9999% reduciendo el tamaño
+ * de cadena para cumplir cómodamente con el límite de 32,767 caracteres por celda de Excel.
+ */
+export function formatEmbeddingForExport(embedding: number[] | null | undefined): string {
+  if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+    return "—";
+  }
+  return JSON.stringify(embedding.map((n) => (typeof n === "number" ? Number(n.toFixed(6)) : 0)));
+}
+

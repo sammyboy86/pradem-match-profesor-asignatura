@@ -46,12 +46,12 @@ export async function GET(req: NextRequest) {
     // 3. Consultar registros filtrados
     let queryBuilder = supabase
       .from("asignaturas")
-      .select("id, clave, nombre, fines_de_aprendizaje_o_formacion, contenido_tematico, actividades_de_aprendizaje, match_nombre, match_semantico, created_at, embedding_768")
+      .select("id, clave, nombre, cluster, fines_de_aprendizaje_o_formacion, contenido_tematico, actividades_de_aprendizaje, match_nombre, match_semantico, created_at, embedding_768")
       .order("id", { ascending: false })
       .range(offset, offset + limit - 1);
 
     if (query) {
-      queryBuilder = queryBuilder.or(`nombre.ilike.%${query}%,clave.ilike.%${query}%`);
+      queryBuilder = queryBuilder.or(`nombre.ilike.%${query}%,clave.ilike.%${query}%,cluster.ilike.%${query}%`);
     }
 
     if (filter === "with_embedding") {
@@ -112,6 +112,7 @@ export async function POST(req: NextRequest) {
     const tableColumns = new Set([
       "clave",
       "nombre",
+      "cluster",
       "fines_de_aprendizaje_o_formacion",
       "contenido_tematico",
       "actividades_de_aprendizaje",
