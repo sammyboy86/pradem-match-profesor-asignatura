@@ -40,6 +40,7 @@ import {
   GitCompare,
   Link2,
   SlidersHorizontal,
+  Table,
 } from "lucide-react";
 import {
   Profesor,
@@ -169,6 +170,21 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     asignaturas_asignadas: true,
   });
   const [exportColSearchTerm, setExportColSearchTerm] = useState("");
+  const [exportPreviewLayout, setExportPreviewLayout] = useState<"matriz" | "detailed">("matriz");
+
+  // Cargar preferencias guardadas de columnas para exportación al iniciar
+  useEffect(() => {
+    try {
+      const savedDoc = localStorage.getItem("pradem_export_doc_cols");
+      if (savedDoc) setSelectedDocenteCols(JSON.parse(savedDoc));
+      const savedAsig = localStorage.getItem("pradem_export_asig_cols");
+      if (savedAsig) setSelectedAsigCols(JSON.parse(savedAsig));
+      const savedMet = localStorage.getItem("pradem_export_metric_cols");
+      if (savedMet) setSelectedMetricCols((prev) => ({ ...prev, ...JSON.parse(savedMet) }));
+    } catch (e) {
+      console.warn("Error al cargar configuración de columnas de exportación:", e);
+    }
+  }, []);
 
   // ── Filtro Regex Anti-Sesgo Docente (Sanitizador de CVs) ──
   const [isRegexModalOpen, setIsRegexModalOpen] = useState(false);
@@ -1199,7 +1215,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
   // ── Exportación a Excel (.xlsx) y CSV con Embeddings (Profesor y Asignatura) ──
   // Descubrir todas las columnas adicionales de asignaturas presentes en los resultados
-  const getAsignaturaExtraColumns = () => {
+  const getAsignaturaExtraColumns = useCallback(() => {
     const allAsigExtraCols = new Set<string>();
     const standardAsigKeys = new Set([
       "id",
@@ -1231,13 +1247,25 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       });
     });
 
+    filteredAsignaturas.forEach((a) => {
+      Object.keys(a).forEach((k) => {
+        if (!standardAsigKeys.has(k) && !k.startsWith("vector_") && !k.startsWith("embedding_")) {
+          allAsigExtraCols.add(k);
+        }
+      });
+    });
+
     return Array.from(allAsigExtraCols);
-  };
+  }, [matchResults, filteredAsignaturas]);
 
   // ── Columnas Disponibles para Selección en la Descarga de Matches ──
   const allAvailableDocenteCols = useMemo(() => {
-    const cols: { key: string; label: string; isStandard?: boolean }[] = [
-      { key: "Nombre Profesor", label: "Nombre Profesor", isStandard: true },
+    const cols: { key: string; label: string; isStandard?: boolean; isVector?: boolean }[] = [
+      {
+        key: "Nombre Profesor",
+        label: nameColumn ? `Nombre Profesor (${nameColumn})` : "Nombre Profesor",
+        isStandard: true,
+      },
       { key: "ID Profesor", label: "ID Profesor", isStandard: true },
     ];
     const seen = new Set<string>(["id", "ID Profesor", "nombre_profesor", "Nombre Profesor"]);
@@ -1250,28 +1278,49 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       }
     });
 
-    if (matchResults.length > 0) {
-      Object.keys(matchResults[0].profesor).forEach((k) => {
-        if (!seen.has(k) && k !== "embedding_768" && k !== "vectors" && k !== "fieldEmbeddings") {
-          seen.add(k);
-          cols.push({ key: k, label: k });
-        }
-      });
-    }
+    matchResults.forEach((r) => {
+      if (r.profesor) {
+        Object.keys(r.profesor).forEach((k) => {
+          if (!seen.has(k) && k !== "embedding_768" && k !== "vectors" && k !== "fieldEmbeddings") {
+            seen.add(k);
+            cols.push({ key: k, label: k });
+          }
+        });
+      }
+    });
 
-    cols.push({ key: "Filtro Anti-Sesgo", label: "Filtro Anti-Sesgo", isStandard: true });
-    cols.push({ key: "Embedding Profesor", label: "Embedding 768d Profesor", isStandard: false });
+    cols.push({ key: "Filtro Anti-Sesgo", label: "Filtro Anti-Sesgo (Estado)", isStandard: true });
+    cols.push({ key: "Embedding Profesor", label: "Embedding 768d Profesor", isStandard: false, isVector: true });
+
+    // Detectar si hay fieldEmbeddings en los profesores
+    const fieldEmbeddingsSet = new Set<string>();
+    matchResults.forEach((r) => {
+      if (r.fieldEmbeddings) {
+        Object.keys(r.fieldEmbeddings).forEach((f) => fieldEmbeddingsSet.add(f));
+      }
+    });
+    fieldEmbeddingsSet.forEach((f) => {
+      const cfg = queryConfigs.find((c) => c.field === f);
+      const label = cfg?.label || f;
+      cols.push({
+        key: `Embedding Profesor (${label})`,
+        label: `Embedding Profesor (${label})`,
+        isStandard: false,
+        isVector: true,
+      });
+    });
+
     return cols;
-  }, [fileHeaders, nameColumn, matchResults]);
+  }, [fileHeaders, nameColumn, matchResults, queryConfigs]);
 
   const allAvailableAsigCols = useMemo(() => {
-    const cols: { key: string; label: string; isStandard?: boolean }[] = [
+    const cols: { key: string; label: string; isStandard?: boolean; isVector?: boolean }[] = [
       { key: "Clave Asignatura", label: "Clave Asignatura", isStandard: true },
       { key: "Nombre Asignatura", label: "Nombre Asignatura", isStandard: true },
       { key: "Cluster Asignatura", label: "Cluster Asignatura", isStandard: true },
       { key: "ID Asignatura", label: "ID Asignatura", isStandard: true },
-      { key: "Contenido Temático", label: "Contenido Temático", isStandard: false },
-      { key: "Fines de Aprendizaje", label: "Fines de Aprendizaje", isStandard: false },
+      { key: "Contenido Temático", label: "Contenido Temático (Temario)", isStandard: false },
+      { key: "Fines de Aprendizaje", label: "Fines de Aprendizaje / Formación", isStandard: false },
       { key: "Actividades de Aprendizaje", label: "Actividades de Aprendizaje", isStandard: false },
     ];
 
@@ -1284,9 +1333,28 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       });
     });
 
-    cols.push({ key: "Embedding Asignatura", label: "Embedding 768d Asignatura", isStandard: false });
+    cols.push({ key: "Embedding Asignatura", label: "Embedding 768d Asignatura", isStandard: false, isVector: true });
+
+    // Multi-vectores de asignaturas si están disponibles
+    const availableMultiVectors = new Set<string>();
+    matchResults.forEach((r) => {
+      r.matches.forEach((m) => {
+        if (m.vectors && typeof m.vectors === "object") {
+          Object.keys(m.vectors).forEach((vk) => availableMultiVectors.add(vk));
+        }
+      });
+    });
+    availableMultiVectors.forEach((vk) => {
+      cols.push({
+        key: `Vector Asignatura (${vk})`,
+        label: `Vector Asignatura (${vk.replace(/_/g, " ")})`,
+        isStandard: false,
+        isVector: true,
+      });
+    });
+
     return cols;
-  }, [matchResults]);
+  }, [matchResults, getAsignaturaExtraColumns]);
 
   const availableMetricCols = useMemo(() => [
     { key: "rank", label: "Rank Match (#1, #2, ...)" },
@@ -1297,10 +1365,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     { key: "asignaturas_asignadas", label: "Total Asignaturas Asignadas (Matriz)" },
   ], []);
 
-  // Helpers para determinar si una columna está seleccionada (default true si aún no se modifica)
+  // Helpers para determinar si una columna está seleccionada
+  // Por defecto: datos normales están seleccionados (true), vectores grandes (embeddings) están deseleccionados (false)
   const isDocenteColSelected = useCallback((key: string): boolean => {
     if (selectedDocenteCols[key] !== undefined) {
       return selectedDocenteCols[key];
+    }
+    if (key === "Embedding Profesor" || key.startsWith("Embedding Profesor (")) {
+      return false;
     }
     return true;
   }, [selectedDocenteCols]);
@@ -1308,6 +1380,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const isAsigColSelected = useCallback((key: string): boolean => {
     if (selectedAsigCols[key] !== undefined) {
       return selectedAsigCols[key];
+    }
+    if (key === "Embedding Asignatura" || key.startsWith("Vector Asignatura (")) {
+      return false;
     }
     return true;
   }, [selectedAsigCols]);
@@ -1319,55 +1394,117 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     return true;
   }, [selectedMetricCols]);
 
+  // Actualizadores con guardado en localStorage
+  const updateSelectedDocenteCols = (updater: (prev: Record<string, boolean>) => Record<string, boolean>) => {
+    setSelectedDocenteCols((prev) => {
+      const next = updater(prev);
+      try { localStorage.setItem("pradem_export_doc_cols", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  const updateSelectedAsigCols = (updater: (prev: Record<string, boolean>) => Record<string, boolean>) => {
+    setSelectedAsigCols((prev) => {
+      const next = updater(prev);
+      try { localStorage.setItem("pradem_export_asig_cols", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  const updateSelectedMetricCols = (updater: (prev: Record<string, boolean>) => Record<string, boolean>) => {
+    setSelectedMetricCols((prev) => {
+      const next = updater(prev);
+      try { localStorage.setItem("pradem_export_metric_cols", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
   const selectAllExportCols = () => {
     const nextDoc: Record<string, boolean> = {};
     allAvailableDocenteCols.forEach((c) => { nextDoc[c.key] = true; });
-    setSelectedDocenteCols(nextDoc);
+    updateSelectedDocenteCols(() => nextDoc);
 
     const nextAsig: Record<string, boolean> = {};
     allAvailableAsigCols.forEach((c) => { nextAsig[c.key] = true; });
-    setSelectedAsigCols(nextAsig);
+    updateSelectedAsigCols(() => nextAsig);
 
     const nextMet: Record<string, boolean> = {};
     availableMetricCols.forEach((m) => { nextMet[m.key] = true; });
-    setSelectedMetricCols(nextMet);
+    updateSelectedMetricCols(() => nextMet);
   };
 
   const deselectAllExportCols = () => {
     const nextDoc: Record<string, boolean> = {};
     allAvailableDocenteCols.forEach((c) => { nextDoc[c.key] = false; });
-    setSelectedDocenteCols(nextDoc);
+    updateSelectedDocenteCols(() => nextDoc);
 
     const nextAsig: Record<string, boolean> = {};
     allAvailableAsigCols.forEach((c) => { nextAsig[c.key] = false; });
-    setSelectedAsigCols(nextAsig);
+    updateSelectedAsigCols(() => nextAsig);
 
     const nextMet: Record<string, boolean> = {};
     availableMetricCols.forEach((m) => { nextMet[m.key] = false; });
-    setSelectedMetricCols(nextMet);
+    updateSelectedMetricCols(() => nextMet);
   };
 
-  const selectEssentialExportCols = () => {
+  const selectRecommendedExportCols = () => {
     const nextDoc: Record<string, boolean> = {};
     allAvailableDocenteCols.forEach((c) => {
-      nextDoc[c.key] = Boolean(c.isStandard && c.key !== "Embedding Profesor");
+      nextDoc[c.key] = !c.isVector && c.key !== "Embedding Profesor" && !c.key.startsWith("Embedding Profesor (");
     });
-    setSelectedDocenteCols(nextDoc);
+    updateSelectedDocenteCols(() => nextDoc);
 
     const nextAsig: Record<string, boolean> = {};
     allAvailableAsigCols.forEach((c) => {
-      nextAsig[c.key] = c.key === "Clave Asignatura" || c.key === "Nombre Asignatura" || c.key === "Cluster Asignatura";
+      nextAsig[c.key] = !c.isVector && c.key !== "Embedding Asignatura" && !c.key.startsWith("Vector Asignatura (");
     });
-    setSelectedAsigCols(nextAsig);
+    updateSelectedAsigCols(() => nextAsig);
 
-    setSelectedMetricCols({
+    updateSelectedMetricCols(() => ({
+      rank: true,
+      similitud_compuesta: true,
+      tipo_match: true,
+      desglose_pares: true,
+      desglose_criterios: true,
+      asignaturas_asignadas: true,
+    }));
+  };
+
+  const selectMinimalExportCols = () => {
+    const nextDoc: Record<string, boolean> = {};
+    allAvailableDocenteCols.forEach((c) => {
+      nextDoc[c.key] = c.key === "Nombre Profesor" || c.key === "ID Profesor";
+    });
+    updateSelectedDocenteCols(() => nextDoc);
+
+    const nextAsig: Record<string, boolean> = {};
+    allAvailableAsigCols.forEach((c) => {
+      nextAsig[c.key] = c.key === "Clave Asignatura" || c.key === "Nombre Asignatura";
+    });
+    updateSelectedAsigCols(() => nextAsig);
+
+    updateSelectedMetricCols(() => ({
       rank: true,
       similitud_compuesta: true,
       tipo_match: true,
       desglose_pares: false,
       desglose_criterios: false,
-      asignaturas_asignadas: true,
-    });
+      asignaturas_asignadas: false,
+    }));
+  };
+
+  const selectWithVectorsExportCols = () => {
+    const nextDoc: Record<string, boolean> = {};
+    allAvailableDocenteCols.forEach((c) => { nextDoc[c.key] = true; });
+    updateSelectedDocenteCols(() => nextDoc);
+
+    const nextAsig: Record<string, boolean> = {};
+    allAvailableAsigCols.forEach((c) => { nextAsig[c.key] = true; });
+    updateSelectedAsigCols(() => nextAsig);
+
+    const nextMet: Record<string, boolean> = {};
+    availableMetricCols.forEach((m) => { nextMet[m.key] = true; });
+    updateSelectedMetricCols(() => nextMet);
   };
 
   const totalSelectedDocenteCount = useMemo(() => {
@@ -1385,200 +1522,111 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const totalSelectedExportCols = totalSelectedDocenteCount + totalSelectedAsigCount + totalSelectedMetricCount;
   const totalAllExportCols = allAvailableDocenteCols.length + allAvailableAsigCols.length + availableMetricCols.length;
 
-  // ── Exportación Matriz a Excel (.xlsx) y CSV (1 Fila por Docente con Columnas Seleccionadas) ──
-  const handleExport = (format: "excel" | "csv") => {
-    if (!matchResults.length) return;
-
-    const extraAsigCols = getAsignaturaExtraColumns();
-
-    // Aplanar los resultados respetando exclusivamente las columnas seleccionadas
-    const rows = matchResults.map((item) => {
-      const rowData: Record<string, any> = {};
-
-      // 1. Columnas seleccionadas del docente
-      const handledDocenteKeys = new Set<string>();
-
-      if (isDocenteColSelected("ID Profesor")) {
-        rowData["ID Profesor"] = item.profesor.id ?? "";
+  // ── Generador de Filas para Vista Previa de Encabezados ──
+  const matrixPreviewHeaders = useMemo(() => {
+    const headers: { name: string; category: "docente" | "asig" | "metric" | "vector" }[] = [];
+    allAvailableDocenteCols.forEach((c) => {
+      if (isDocenteColSelected(c.key)) {
+        headers.push({ name: c.key, category: c.isVector ? "vector" : "docente" });
       }
-      if (isDocenteColSelected("Nombre Profesor")) {
-        rowData["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
+    });
+    if (isMetricColSelected("asignaturas_asignadas")) {
+      headers.push({ name: "Asignaturas Asignadas", category: "metric" });
+    }
+    const samplePrefix = "Match 1";
+    if (isMetricColSelected("rank")) headers.push({ name: `${samplePrefix} - Rank`, category: "metric" });
+    if (isAsigColSelected("Nombre Asignatura")) headers.push({ name: `${samplePrefix} - Asignatura`, category: "asig" });
+    if (isAsigColSelected("Clave Asignatura")) headers.push({ name: `${samplePrefix} - Clave`, category: "asig" });
+    if (isAsigColSelected("Cluster Asignatura")) headers.push({ name: `${samplePrefix} - Cluster`, category: "asig" });
+    if (isAsigColSelected("ID Asignatura")) headers.push({ name: `${samplePrefix} - ID Asignatura`, category: "asig" });
+    if (isMetricColSelected("similitud_compuesta")) headers.push({ name: `${samplePrefix} - Similitud Compuesta`, category: "metric" });
+    if (isMetricColSelected("tipo_match")) headers.push({ name: `${samplePrefix} - Tipo Match`, category: "metric" });
+    if (isMetricColSelected("desglose_pares")) headers.push({ name: `${samplePrefix} - Desglose Pares`, category: "metric" });
+    if (isMetricColSelected("desglose_criterios")) headers.push({ name: `${samplePrefix} - Desglose Criterios`, category: "metric" });
+    if (isAsigColSelected("Contenido Temático")) headers.push({ name: `${samplePrefix} - Contenido Temático`, category: "asig" });
+    if (isAsigColSelected("Fines de Aprendizaje")) headers.push({ name: `${samplePrefix} - Fines de Aprendizaje`, category: "asig" });
+    if (isAsigColSelected("Actividades de Aprendizaje")) headers.push({ name: `${samplePrefix} - Actividades de Aprendizaje`, category: "asig" });
+
+    const extraCols = getAsignaturaExtraColumns();
+    extraCols.forEach((extraCol) => {
+      const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
+      if (isAsigColSelected(label)) {
+        headers.push({ name: `${samplePrefix} - ${extraCol.replace(/_/g, " ")}`, category: "asig" });
       }
-      handledDocenteKeys.add("id");
-      handledDocenteKeys.add("ID Profesor");
-      handledDocenteKeys.add("nombre_profesor");
-      handledDocenteKeys.add("Nombre Profesor");
-      if (nameColumn) handledDocenteKeys.add(nameColumn);
+    });
 
-      // Recopilar todas las columnas del archivo o del objeto profesor
-      const allDocenteCols = new Set<string>();
-      fileHeaders.forEach((h) => allDocenteCols.add(h));
-      Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
+    if (isAsigColSelected("Embedding Asignatura")) {
+      headers.push({ name: `${samplePrefix} - Embedding Asignatura`, category: "vector" });
+    }
 
-      allDocenteCols.forEach((col) => {
-        if (
-          handledDocenteKeys.has(col) ||
-          col === "embedding_768" ||
-          col === "vectors" ||
-          col === "fieldEmbeddings"
-        ) {
-          return;
-        }
+    return headers;
+  }, [allAvailableDocenteCols, isDocenteColSelected, isMetricColSelected, isAsigColSelected, getAsignaturaExtraColumns]);
 
-        if (isDocenteColSelected(col)) {
-          let val = item.profesor[col] ?? "";
-          if (
-            item.sanitizationStatus === "sanitized" &&
-            typeof val === "string" &&
-            regexFilterConfig?.enabled
-          ) {
-            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
-            val = res.sanitizedText;
-          }
-          rowData[col] = val;
-        }
-        handledDocenteKeys.add(col);
-      });
-
-      if (isDocenteColSelected("Embedding Profesor")) {
-        rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+  const detailedPreviewHeaders = useMemo(() => {
+    const headers: { name: string; category: "docente" | "asig" | "metric" | "vector" }[] = [];
+    allAvailableDocenteCols.forEach((c) => {
+      if (isDocenteColSelected(c.key)) {
+        headers.push({ name: c.key, category: c.isVector ? "vector" : "docente" });
       }
+    });
+    if (isMetricColSelected("rank")) headers.push({ name: "Rank Match", category: "metric" });
+    if (isMetricColSelected("similitud_compuesta")) headers.push({ name: "Similitud Compuesta", category: "metric" });
+    if (isMetricColSelected("tipo_match")) headers.push({ name: "Tipo Match", category: "metric" });
+    if (isMetricColSelected("desglose_pares")) headers.push({ name: "Desglose Pares (Multi-Vector)", category: "metric" });
+    if (isMetricColSelected("desglose_criterios")) headers.push({ name: "Desglose Criterios", category: "metric" });
+    if (isAsigColSelected("ID Asignatura")) headers.push({ name: "ID Asignatura", category: "asig" });
+    if (isAsigColSelected("Clave Asignatura")) headers.push({ name: "Clave Asignatura", category: "asig" });
+    if (isAsigColSelected("Nombre Asignatura")) headers.push({ name: "Nombre Asignatura", category: "asig" });
+    if (isAsigColSelected("Cluster Asignatura")) headers.push({ name: "Cluster Asignatura", category: "asig" });
+    if (isAsigColSelected("Contenido Temático")) headers.push({ name: "Contenido Temático", category: "asig" });
+    if (isAsigColSelected("Fines de Aprendizaje")) headers.push({ name: "Fines de Aprendizaje", category: "asig" });
+    if (isAsigColSelected("Actividades de Aprendizaje")) headers.push({ name: "Actividades de Aprendizaje", category: "asig" });
 
-      if (isDocenteColSelected("Filtro Anti-Sesgo") && item.sanitizationStatus) {
-        rowData["Filtro Anti-Sesgo"] =
-          item.sanitizationStatus === "intact"
-            ? "Intacto (Credencial pedagógica)"
-            : item.sanitizationStatus === "sanitized"
-            ? "Sanitizado (Sesgo mitigado)"
-            : "Inactivo";
+    const extraCols = getAsignaturaExtraColumns();
+    extraCols.forEach((extraCol) => {
+      const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
+      if (isAsigColSelected(label)) {
+        headers.push({ name: label, category: "asig" });
       }
+    });
 
-      if (isMetricColSelected("asignaturas_asignadas")) {
-        rowData["Asignaturas Asignadas"] = item.matches.length;
-      }
+    if (isAsigColSelected("Embedding Asignatura")) {
+      headers.push({ name: "Embedding Asignatura", category: "vector" });
+    }
 
-      // Determinar cuántas columnas de match exportar
+    return headers;
+  }, [allAvailableDocenteCols, isDocenteColSelected, isMetricColSelected, isAsigColSelected, getAsignaturaExtraColumns]);
+
+  // ── Generación de Filas Formato Matriz (1 Fila por Docente) ──
+  const generateMatrixRows = useCallback(
+    (results: ProfesorMatchResult[]): Record<string, any>[] => {
+      if (!results.length) return [];
+      const extraAsigCols = getAsignaturaExtraColumns();
+
       const maxMatchesToExport = Math.max(
         1,
         filterMode === "threshold"
-          ? Math.max(...matchResults.map((r) => r.matches.length), 1)
+          ? Math.max(...results.map((r) => r.matches.length), 1)
           : topK
       );
 
-      // Desglosar cada una de las recomendaciones con las columnas de asignatura seleccionadas
-      for (let k = 0; k < maxMatchesToExport; k++) {
-        const m = item.matches[k];
-        const prefix = `Match ${k + 1}`;
-        if (m) {
-          if (isAsigColSelected("Nombre Asignatura")) {
-            rowData[`${prefix} - Asignatura`] = m.nombre;
-          }
-          if (isAsigColSelected("Clave Asignatura")) {
-            rowData[`${prefix} - Clave`] = m.clave;
-          }
-          if (isAsigColSelected("Cluster Asignatura")) {
-            rowData[`${prefix} - Cluster`] = m.cluster || "Sin Cluster";
-          }
-          if (isMetricColSelected("tipo_match")) {
-            rowData[`${prefix} - Tipo`] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
-          }
-          if (isMetricColSelected("similitud_compuesta")) {
-            rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
-          }
+      return results.map((item) => {
+        const rowData: Record<string, any> = {};
 
-          if (isMetricColSelected("desglose_pares") && m.pairSimilarities && Object.keys(m.pairSimilarities).length > 0) {
-            const desglosePares = Object.entries(m.pairSimilarities)
-              .map(([pairKey, score]) => {
-                const pairCfg = distancePairs.find((p) => p.id === pairKey);
-                const label = pairCfg?.label || pairKey;
-                return `${label}: ${(score * 100).toFixed(0)}%`;
-              })
-              .join(" | ");
-            rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = desglosePares;
-          }
-
-          if (isMetricColSelected("desglose_criterios") && m.fieldSimilarities) {
-            const desglose = Object.entries(m.fieldSimilarities)
-              .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
-              .join(" | ");
-            rowData[`${prefix} - Desglose`] = desglose;
-          }
-
-          if (isAsigColSelected("Contenido Temático")) {
-            rowData[`${prefix} - Contenido Temático`] = m.contenido_tematico || "";
-          }
-          if (isAsigColSelected("Fines de Aprendizaje")) {
-            rowData[`${prefix} - Fines de Aprendizaje`] = m.fines_de_aprendizaje_o_formacion || "";
-          }
-          if (isAsigColSelected("Actividades de Aprendizaje")) {
-            rowData[`${prefix} - Actividades de Aprendizaje`] = m.actividades_de_aprendizaje || "";
-          }
-
-          extraAsigCols.forEach((extraCol) => {
-            const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
-            if (isAsigColSelected(label)) {
-              rowData[`${prefix} - ${extraCol.replace(/_/g, " ")}`] = m[extraCol] ?? "";
-            }
-          });
-
-          if (isAsigColSelected("Embedding Asignatura")) {
-            rowData[`${prefix} - Embedding Asignatura`] = formatEmbeddingForExport(m.embedding_768);
-          }
-        } else {
-          if (isAsigColSelected("Nombre Asignatura")) rowData[`${prefix} - Asignatura`] = "—";
-          if (isAsigColSelected("Clave Asignatura")) rowData[`${prefix} - Clave`] = "—";
-          if (isAsigColSelected("Cluster Asignatura")) rowData[`${prefix} - Cluster`] = "—";
-          if (isMetricColSelected("tipo_match")) rowData[`${prefix} - Tipo`] = "—";
-          if (isMetricColSelected("similitud_compuesta")) rowData[`${prefix} - Similitud Compuesta`] = "—";
-          if (isMetricColSelected("desglose_pares")) rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = "—";
-          if (isMetricColSelected("desglose_criterios")) rowData[`${prefix} - Desglose`] = "—";
-          if (isAsigColSelected("Contenido Temático")) rowData[`${prefix} - Contenido Temático`] = "—";
-          if (isAsigColSelected("Fines de Aprendizaje")) rowData[`${prefix} - Fines de Aprendizaje`] = "—";
-          if (isAsigColSelected("Actividades de Aprendizaje")) rowData[`${prefix} - Actividades de Aprendizaje`] = "—";
-          extraAsigCols.forEach((extraCol) => {
-            const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
-            if (isAsigColSelected(label)) {
-              rowData[`${prefix} - ${extraCol.replace(/_/g, " ")}`] = "—";
-            }
-          });
-          if (isAsigColSelected("Embedding Asignatura")) rowData[`${prefix} - Embedding Asignatura`] = "—";
-        }
-      }
-
-      return rowData;
-    });
-
-    const filename = `Match_Matriz_Docentes_Asignaturas_${new Date().toISOString().slice(0, 10)}`;
-    if (format === "excel") {
-      exportToExcel(rows, filename);
-    } else {
-      exportToCsv(rows, filename);
-    }
-  };
-
-  // ── Exportación Detallada Par a Par (1 Fila por Match con Columnas Seleccionadas) ──
-  const handleExportDetailed = (format: "excel" | "csv") => {
-    if (!matchResults.length) return;
-
-    const extraAsigCols = getAsignaturaExtraColumns();
-    const rows: Record<string, any>[] = [];
-
-    matchResults.forEach((item) => {
-      // Helper para extraer las columnas seleccionadas del docente
-      const extractDocenteData = () => {
-        const d: Record<string, any> = {};
-        const handledDocenteKeys = new Set<string>();
-
+        // 1. Columnas seleccionadas del docente
         if (isDocenteColSelected("ID Profesor")) {
-          d["ID Profesor"] = item.profesor.id ?? "";
+          rowData["ID Profesor"] = item.profesor.id ?? "";
         }
         if (isDocenteColSelected("Nombre Profesor")) {
-          d["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
+          rowData["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
         }
-        handledDocenteKeys.add("id");
-        handledDocenteKeys.add("ID Profesor");
-        handledDocenteKeys.add("nombre_profesor");
-        handledDocenteKeys.add("Nombre Profesor");
+
+        const handledDocenteKeys = new Set<string>([
+          "id",
+          "ID Profesor",
+          "nombre_profesor",
+          "Nombre Profesor",
+        ]);
         if (nameColumn) handledDocenteKeys.add(nameColumn);
 
         const allDocenteCols = new Set<string>();
@@ -1605,17 +1653,13 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
               val = res.sanitizedText;
             }
-            d[col] = val;
+            rowData[col] = val;
           }
           handledDocenteKeys.add(col);
         });
 
-        if (isDocenteColSelected("Embedding Profesor")) {
-          d["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
-        }
-
         if (isDocenteColSelected("Filtro Anti-Sesgo") && item.sanitizationStatus) {
-          d["Filtro Anti-Sesgo"] =
+          rowData["Filtro Anti-Sesgo"] =
             item.sanitizationStatus === "intact"
               ? "Intacto (Credencial pedagógica)"
               : item.sanitizationStatus === "sanitized"
@@ -1623,94 +1667,390 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               : "Inactivo";
         }
 
-        return d;
-      };
+        if (isDocenteColSelected("Embedding Profesor")) {
+          rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+        }
 
-      const baseDocenteData = extractDocenteData();
+        if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
+          Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
+            const cfg = queryConfigs.find((c) => c.field === field);
+            const label = cfg?.label || field;
+            const key = `Embedding Profesor (${label})`;
+            if (isDocenteColSelected(key)) {
+              rowData[key] = formatEmbeddingForExport(vec);
+            }
+          });
+        }
 
-      // Si el profesor no tuvo asignaturas sobre el umbral
-      if (!item.matches.length) {
-        const emptyRow: Record<string, any> = { ...baseDocenteData };
-        if (isMetricColSelected("rank")) emptyRow["Rank Match"] = "—";
-        if (isMetricColSelected("similitud_compuesta")) emptyRow["Similitud Compuesta"] = "Sin matches";
-        if (isMetricColSelected("tipo_match")) emptyRow["Tipo Match"] = "—";
-        if (isMetricColSelected("desglose_pares")) emptyRow["Desglose Pares (Multi-Vector)"] = "—";
-        if (isMetricColSelected("desglose_criterios")) emptyRow["Desglose Criterios"] = "—";
+        if (isMetricColSelected("asignaturas_asignadas")) {
+          rowData["Asignaturas Asignadas"] = item.matches.length;
+        }
 
-        if (isAsigColSelected("ID Asignatura")) emptyRow["ID Asignatura"] = "—";
-        if (isAsigColSelected("Clave Asignatura")) emptyRow["Clave Asignatura"] = "—";
-        if (isAsigColSelected("Nombre Asignatura")) emptyRow["Nombre Asignatura"] = "—";
-        if (isAsigColSelected("Cluster Asignatura")) emptyRow["Cluster Asignatura"] = "—";
-        if (isAsigColSelected("Contenido Temático")) emptyRow["Contenido Temático"] = "—";
-        if (isAsigColSelected("Fines de Aprendizaje")) emptyRow["Fines de Aprendizaje"] = "—";
-        if (isAsigColSelected("Actividades de Aprendizaje")) emptyRow["Actividades de Aprendizaje"] = "—";
-        extraAsigCols.forEach((c) => {
-          const label = `Asignatura - ${c.replace(/_/g, " ")}`;
-          if (isAsigColSelected(label)) {
-            emptyRow[label] = "—";
+        // 2. Columnas por cada Match de la Asignatura
+        for (let k = 0; k < maxMatchesToExport; k++) {
+          const m = item.matches[k];
+          const prefix = `Match ${k + 1}`;
+
+          if (m) {
+            if (isMetricColSelected("rank")) {
+              rowData[`${prefix} - Rank`] = `#${k + 1}`;
+            }
+            if (isAsigColSelected("Nombre Asignatura")) {
+              rowData[`${prefix} - Asignatura`] = m.nombre ?? "";
+            }
+            if (isAsigColSelected("Clave Asignatura")) {
+              rowData[`${prefix} - Clave`] = m.clave ?? "";
+            }
+            if (isAsigColSelected("Cluster Asignatura")) {
+              rowData[`${prefix} - Cluster`] = m.cluster || "Sin Cluster";
+            }
+            if (isAsigColSelected("ID Asignatura")) {
+              rowData[`${prefix} - ID Asignatura`] = m.asignaturaId ?? m.id ?? "";
+            }
+            if (isMetricColSelected("similitud_compuesta")) {
+              rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
+            }
+            if (isMetricColSelected("tipo_match")) {
+              rowData[`${prefix} - Tipo Match`] = m.match_nombre
+                ? "Match Nombre (Exento de cupo)"
+                : "Semántico";
+            }
+
+            if (
+              isMetricColSelected("desglose_pares") &&
+              m.pairSimilarities &&
+              Object.keys(m.pairSimilarities).length > 0
+            ) {
+              const desglosePares = Object.entries(m.pairSimilarities)
+                .map(([pairKey, score]) => {
+                  const pairCfg = distancePairs.find((p) => p.id === pairKey);
+                  const label = pairCfg?.label || pairKey;
+                  return `${label}: ${(score * 100).toFixed(0)}%`;
+                })
+                .join(" | ");
+              rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = desglosePares;
+            }
+
+            if (isMetricColSelected("desglose_criterios") && m.fieldSimilarities) {
+              const desglose = Object.entries(m.fieldSimilarities)
+                .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
+                .join(" | ");
+              rowData[`${prefix} - Desglose Criterios`] = desglose;
+            }
+
+            if (isAsigColSelected("Contenido Temático")) {
+              rowData[`${prefix} - Contenido Temático`] = m.contenido_tematico || "";
+            }
+            if (isAsigColSelected("Fines de Aprendizaje")) {
+              rowData[`${prefix} - Fines de Aprendizaje`] = m.fines_de_aprendizaje_o_formacion || "";
+            }
+            if (isAsigColSelected("Actividades de Aprendizaje")) {
+              rowData[`${prefix} - Actividades de Aprendizaje`] = m.actividades_de_aprendizaje || "";
+            }
+
+            extraAsigCols.forEach((extraCol) => {
+              const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
+              if (isAsigColSelected(label)) {
+                rowData[`${prefix} - ${extraCol.replace(/_/g, " ")}`] = m[extraCol] ?? "";
+              }
+            });
+
+            if (isAsigColSelected("Embedding Asignatura")) {
+              rowData[`${prefix} - Embedding Asignatura`] = formatEmbeddingForExport(m.embedding_768);
+            }
+
+            if (m.vectors && typeof m.vectors === "object") {
+              Object.entries(m.vectors).forEach(([vk, vec]) => {
+                const vecKey = `Vector Asignatura (${vk})`;
+                if (isAsigColSelected(vecKey)) {
+                  rowData[`${prefix} - Vector (${vk})`] = formatEmbeddingForExport(vec);
+                }
+              });
+            }
+          } else {
+            if (isMetricColSelected("rank")) rowData[`${prefix} - Rank`] = "—";
+            if (isAsigColSelected("Nombre Asignatura")) rowData[`${prefix} - Asignatura`] = "—";
+            if (isAsigColSelected("Clave Asignatura")) rowData[`${prefix} - Clave`] = "—";
+            if (isAsigColSelected("Cluster Asignatura")) rowData[`${prefix} - Cluster`] = "—";
+            if (isAsigColSelected("ID Asignatura")) rowData[`${prefix} - ID Asignatura`] = "—";
+            if (isMetricColSelected("similitud_compuesta")) rowData[`${prefix} - Similitud Compuesta`] = "—";
+            if (isMetricColSelected("tipo_match")) rowData[`${prefix} - Tipo Match`] = "—";
+            if (isMetricColSelected("desglose_pares")) rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = "—";
+            if (isMetricColSelected("desglose_criterios")) rowData[`${prefix} - Desglose Criterios`] = "—";
+            if (isAsigColSelected("Contenido Temático")) rowData[`${prefix} - Contenido Temático`] = "—";
+            if (isAsigColSelected("Fines de Aprendizaje")) rowData[`${prefix} - Fines de Aprendizaje`] = "—";
+            if (isAsigColSelected("Actividades de Aprendizaje")) rowData[`${prefix} - Actividades de Aprendizaje`] = "—";
+            extraAsigCols.forEach((extraCol) => {
+              const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
+              if (isAsigColSelected(label)) {
+                rowData[`${prefix} - ${extraCol.replace(/_/g, " ")}`] = "—";
+              }
+            });
+            if (isAsigColSelected("Embedding Asignatura")) rowData[`${prefix} - Embedding Asignatura`] = "—";
           }
-        });
-        if (isAsigColSelected("Embedding Asignatura")) emptyRow["Embedding Asignatura"] = "—";
-        rows.push(emptyRow);
-        return;
-      }
-
-      // 1 fila por cada match par a par con las columnas seleccionadas
-      item.matches.forEach((m, idx) => {
-        const rowData: Record<string, any> = { ...baseDocenteData };
-        if (isMetricColSelected("rank")) {
-          rowData["Rank Match"] = `#${idx + 1}`;
-        }
-        if (isMetricColSelected("similitud_compuesta")) {
-          rowData["Similitud Compuesta"] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
-        }
-        if (isMetricColSelected("tipo_match")) {
-          rowData["Tipo Match"] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
         }
 
-        if (isMetricColSelected("desglose_pares") && m.pairSimilarities && Object.keys(m.pairSimilarities).length > 0) {
-          const desglosePares = Object.entries(m.pairSimilarities)
-            .map(([pairKey, score]) => {
-              const pairCfg = distancePairs.find((p) => p.id === pairKey);
-              const label = pairCfg?.label || pairKey;
-              return `${label}: ${(score * 100).toFixed(0)}%`;
-            })
-            .join(" | ");
-          rowData["Desglose Pares (Multi-Vector)"] = desglosePares;
-        }
-
-        if (isMetricColSelected("desglose_criterios") && m.fieldSimilarities) {
-          const desglose = Object.entries(m.fieldSimilarities)
-            .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
-            .join(" | ");
-          rowData["Desglose Criterios"] = desglose;
-        }
-
-        // Columnas de la asignatura
-        if (isAsigColSelected("ID Asignatura")) rowData["ID Asignatura"] = m.asignaturaId ?? m.id ?? "";
-        if (isAsigColSelected("Clave Asignatura")) rowData["Clave Asignatura"] = m.clave ?? "";
-        if (isAsigColSelected("Nombre Asignatura")) rowData["Nombre Asignatura"] = m.nombre ?? "";
-        if (isAsigColSelected("Cluster Asignatura")) rowData["Cluster Asignatura"] = m.cluster || "Sin Cluster";
-        if (isAsigColSelected("Contenido Temático")) rowData["Contenido Temático"] = m.contenido_tematico || "";
-        if (isAsigColSelected("Fines de Aprendizaje")) rowData["Fines de Aprendizaje"] = m.fines_de_aprendizaje_o_formacion || "";
-        if (isAsigColSelected("Actividades de Aprendizaje")) rowData["Actividades de Aprendizaje"] = m.actividades_de_aprendizaje || "";
-
-        extraAsigCols.forEach((extraCol) => {
-          const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
-          if (isAsigColSelected(label)) {
-            rowData[label] = m[extraCol] ?? "";
-          }
-        });
-
-        if (isAsigColSelected("Embedding Asignatura")) {
-          rowData["Embedding Asignatura"] = formatEmbeddingForExport(m.embedding_768);
-        }
-
-        rows.push(rowData);
+        return rowData;
       });
-    });
+    },
+    [
+      filterMode,
+      topK,
+      nameColumn,
+      fileHeaders,
+      regexFilterConfig,
+      distancePairs,
+      queryConfigs,
+      getAsignaturaExtraColumns,
+      isDocenteColSelected,
+      isAsigColSelected,
+      isMetricColSelected,
+    ]
+  );
 
+  // ── Generación de Filas Formato Detalle Par a Par (1 Fila por Match) ──
+  const generateDetailedRows = useCallback(
+    (results: ProfesorMatchResult[]): Record<string, any>[] => {
+      if (!results.length) return [];
+      const extraAsigCols = getAsignaturaExtraColumns();
+      const rows: Record<string, any>[] = [];
+
+      results.forEach((item) => {
+        const extractDocenteData = () => {
+          const d: Record<string, any> = {};
+          if (isDocenteColSelected("ID Profesor")) {
+            d["ID Profesor"] = item.profesor.id ?? "";
+          }
+          if (isDocenteColSelected("Nombre Profesor")) {
+            d["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
+          }
+
+          const handledDocenteKeys = new Set<string>([
+            "id",
+            "ID Profesor",
+            "nombre_profesor",
+            "Nombre Profesor",
+          ]);
+          if (nameColumn) handledDocenteKeys.add(nameColumn);
+
+          const allDocenteCols = new Set<string>();
+          fileHeaders.forEach((h) => allDocenteCols.add(h));
+          Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
+
+          allDocenteCols.forEach((col) => {
+            if (
+              handledDocenteKeys.has(col) ||
+              col === "embedding_768" ||
+              col === "vectors" ||
+              col === "fieldEmbeddings"
+            ) {
+              return;
+            }
+
+            if (isDocenteColSelected(col)) {
+              let val = item.profesor[col] ?? "";
+              if (
+                item.sanitizationStatus === "sanitized" &&
+                typeof val === "string" &&
+                regexFilterConfig?.enabled
+              ) {
+                const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+                val = res.sanitizedText;
+              }
+              d[col] = val;
+            }
+            handledDocenteKeys.add(col);
+          });
+
+          if (isDocenteColSelected("Filtro Anti-Sesgo") && item.sanitizationStatus) {
+            d["Filtro Anti-Sesgo"] =
+              item.sanitizationStatus === "intact"
+                ? "Intacto (Credencial pedagógica)"
+                : item.sanitizationStatus === "sanitized"
+                ? "Sanitizado (Sesgo mitigado)"
+                : "Inactivo";
+          }
+
+          if (isDocenteColSelected("Embedding Profesor")) {
+            d["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+          }
+
+          if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
+            Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
+              const cfg = queryConfigs.find((c) => c.field === field);
+              const label = cfg?.label || field;
+              const key = `Embedding Profesor (${label})`;
+              if (isDocenteColSelected(key)) {
+                d[key] = formatEmbeddingForExport(vec);
+              }
+            });
+          }
+
+          return d;
+        };
+
+        const baseDocenteData = extractDocenteData();
+
+        if (!item.matches.length) {
+          const emptyRow: Record<string, any> = { ...baseDocenteData };
+          if (isMetricColSelected("rank")) emptyRow["Rank Match"] = "—";
+          if (isMetricColSelected("similitud_compuesta")) emptyRow["Similitud Compuesta"] = "Sin matches";
+          if (isMetricColSelected("tipo_match")) emptyRow["Tipo Match"] = "—";
+          if (isMetricColSelected("desglose_pares")) emptyRow["Desglose Pares (Multi-Vector)"] = "—";
+          if (isMetricColSelected("desglose_criterios")) emptyRow["Desglose Criterios"] = "—";
+
+          if (isAsigColSelected("ID Asignatura")) emptyRow["ID Asignatura"] = "—";
+          if (isAsigColSelected("Clave Asignatura")) emptyRow["Clave Asignatura"] = "—";
+          if (isAsigColSelected("Nombre Asignatura")) emptyRow["Nombre Asignatura"] = "—";
+          if (isAsigColSelected("Cluster Asignatura")) emptyRow["Cluster Asignatura"] = "—";
+          if (isAsigColSelected("Contenido Temático")) emptyRow["Contenido Temático"] = "—";
+          if (isAsigColSelected("Fines de Aprendizaje")) emptyRow["Fines de Aprendizaje"] = "—";
+          if (isAsigColSelected("Actividades de Aprendizaje")) emptyRow["Actividades de Aprendizaje"] = "—";
+          extraAsigCols.forEach((c) => {
+            const label = `Asignatura - ${c.replace(/_/g, " ")}`;
+            if (isAsigColSelected(label)) {
+              emptyRow[label] = "—";
+            }
+          });
+          if (isAsigColSelected("Embedding Asignatura")) emptyRow["Embedding Asignatura"] = "—";
+          rows.push(emptyRow);
+          return;
+        }
+
+        item.matches.forEach((m, idx) => {
+          const rowData: Record<string, any> = { ...baseDocenteData };
+          if (isMetricColSelected("rank")) {
+            rowData["Rank Match"] = `#${idx + 1}`;
+          }
+          if (isMetricColSelected("similitud_compuesta")) {
+            rowData["Similitud Compuesta"] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
+          }
+          if (isMetricColSelected("tipo_match")) {
+            rowData["Tipo Match"] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
+          }
+
+          if (
+            isMetricColSelected("desglose_pares") &&
+            m.pairSimilarities &&
+            Object.keys(m.pairSimilarities).length > 0
+          ) {
+            const desglosePares = Object.entries(m.pairSimilarities)
+              .map(([pairKey, score]) => {
+                const pairCfg = distancePairs.find((p) => p.id === pairKey);
+                const label = pairCfg?.label || pairKey;
+                return `${label}: ${(score * 100).toFixed(0)}%`;
+              })
+              .join(" | ");
+            rowData["Desglose Pares (Multi-Vector)"] = desglosePares;
+          }
+
+          if (isMetricColSelected("desglose_criterios") && m.fieldSimilarities) {
+            const desglose = Object.entries(m.fieldSimilarities)
+              .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
+              .join(" | ");
+            rowData["Desglose Criterios"] = desglose;
+          }
+
+          if (isAsigColSelected("ID Asignatura")) rowData["ID Asignatura"] = m.asignaturaId ?? m.id ?? "";
+          if (isAsigColSelected("Clave Asignatura")) rowData["Clave Asignatura"] = m.clave ?? "";
+          if (isAsigColSelected("Nombre Asignatura")) rowData["Nombre Asignatura"] = m.nombre ?? "";
+          if (isAsigColSelected("Cluster Asignatura")) rowData["Cluster Asignatura"] = m.cluster || "Sin Cluster";
+          if (isAsigColSelected("Contenido Temático")) rowData["Contenido Temático"] = m.contenido_tematico || "";
+          if (isAsigColSelected("Fines de Aprendizaje")) rowData["Fines de Aprendizaje"] = m.fines_de_aprendizaje_o_formacion || "";
+          if (isAsigColSelected("Actividades de Aprendizaje")) rowData["Actividades de Aprendizaje"] = m.actividades_de_aprendizaje || "";
+
+          extraAsigCols.forEach((extraCol) => {
+            const label = `Asignatura - ${extraCol.replace(/_/g, " ")}`;
+            if (isAsigColSelected(label)) {
+              rowData[label] = m[extraCol] ?? "";
+            }
+          });
+
+          if (isAsigColSelected("Embedding Asignatura")) {
+            rowData["Embedding Asignatura"] = formatEmbeddingForExport(m.embedding_768);
+          }
+
+          if (m.vectors && typeof m.vectors === "object") {
+            Object.entries(m.vectors).forEach(([vk, vec]) => {
+              const vecKey = `Vector Asignatura (${vk})`;
+              if (isAsigColSelected(vecKey)) {
+                rowData[`Vector Asignatura (${vk})`] = formatEmbeddingForExport(vec);
+              }
+            });
+          }
+
+          rows.push(rowData);
+        });
+      });
+
+      return rows;
+    },
+    [
+      nameColumn,
+      fileHeaders,
+      regexFilterConfig,
+      distancePairs,
+      queryConfigs,
+      getAsignaturaExtraColumns,
+      isDocenteColSelected,
+      isAsigColSelected,
+      isMetricColSelected,
+    ]
+  );
+
+  // ── Handlers de Descarga Global ──
+  const handleExport = (format: "excel" | "csv") => {
+    if (!matchResults.length) return;
+    if (totalSelectedExportCols === 0) {
+      alert("Debes seleccionar al menos una columna para exportar. Abre el panel de 'Columnas a Exportar'.");
+      setIsExportConfigOpen(true);
+      return;
+    }
+
+    const rows = generateMatrixRows(matchResults);
+    const filename = `Match_Matriz_Docentes_Asignaturas_${new Date().toISOString().slice(0, 10)}`;
+    if (format === "excel") {
+      exportToExcel(rows, filename);
+    } else {
+      exportToCsv(rows, filename);
+    }
+  };
+
+  const handleExportDetailed = (format: "excel" | "csv") => {
+    if (!matchResults.length) return;
+    if (totalSelectedExportCols === 0) {
+      alert("Debes seleccionar al menos una columna para exportar. Abre el panel de 'Columnas a Exportar'.");
+      setIsExportConfigOpen(true);
+      return;
+    }
+
+    const rows = generateDetailedRows(matchResults);
     const filename = `Match_Detallado_Docente_Asignatura_${new Date().toISOString().slice(0, 10)}`;
+    if (format === "excel") {
+      exportToExcel(rows, filename);
+    } else {
+      exportToCsv(rows, filename);
+    }
+  };
+
+  // ── Descarga de Matches de un Profesor Individual ──
+  const handleExportSingleProfessor = (
+    result: ProfesorMatchResult,
+    format: "excel" | "csv",
+    layout: "matriz" | "detailed" = "detailed"
+  ) => {
+    if (totalSelectedExportCols === 0) {
+      alert("Debes seleccionar al menos una columna para exportar. Abre el panel de 'Columnas a Exportar'.");
+      setIsExportConfigOpen(true);
+      return;
+    }
+
+    const safeName = (result.profesor.nombre_profesor || `Profesor_${result.profesor.id}`)
+      .replace(/[^a-zA-Z0-9_\-]/g, "_")
+      .slice(0, 30);
+    const filename = `Match_${safeName}_${layout}_${new Date().toISOString().slice(0, 10)}`;
+    const rows = layout === "matriz" ? generateMatrixRows([result]) : generateDetailedRows([result]);
+
     if (format === "excel") {
       exportToExcel(rows, filename);
     } else {
@@ -3411,22 +3751,21 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               </p>
             </div>
 
-            {/* Botones de Exportación: Matriz y Detalle Par a Par con todas las columnas */}
             {/* Botones de Exportación y Personalización de Columnas */}
             <div className="flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
                 onClick={() => setIsExportConfigOpen(!isExportConfigOpen)}
-                className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition cursor-pointer shadow-sm ${
+                className={`flex items-center gap-2 rounded-xl border px-3.5 py-1.5 text-xs font-semibold transition cursor-pointer shadow-sm ${
                   isExportConfigOpen
-                    ? "bg-cyan-500/20 border-cyan-400 text-cyan-200 ring-1 ring-cyan-400/50"
-                    : "bg-slate-900 border-white/15 text-slate-300 hover:border-cyan-500/40 hover:text-white"
+                    ? "bg-cyan-500/20 border-cyan-400 text-cyan-200 ring-2 ring-cyan-400/40 shadow-cyan-500/10"
+                    : "bg-slate-900 border-cyan-500/30 text-white hover:border-cyan-400 hover:bg-cyan-500/10"
                 }`}
-                title="Configurar qué columnas de profesor y asignatura incluir en el archivo descargable"
+                title="Configurar qué columnas de profesor y qué columnas de asignatura incluir en el archivo descargable"
               >
                 <SlidersHorizontal className="h-3.5 w-3.5 text-cyan-400" />
-                <span>Columnas a Exportar</span>
-                <span className="rounded-full bg-cyan-500/20 px-2 py-0.2 text-[10px] font-mono text-cyan-300 border border-cyan-500/30">
+                <span>Elegir Columnas a Exportar</span>
+                <span className="rounded-full bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/30">
                   {totalSelectedExportCols}/{totalAllExportCols}
                 </span>
                 <ChevronDown className={`h-3 w-3 text-slate-400 transition-transform ${isExportConfigOpen ? "rotate-180" : ""}`} />
@@ -3440,7 +3779,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   type="button"
                   onClick={() => handleExport("excel")}
                   className="flex items-center gap-1 rounded-lg bg-emerald-600/30 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-600/50 transition cursor-pointer"
-                  title="Descargar matriz con las columnas seleccionadas (.xlsx)"
+                  title="Descargar matriz (1 fila por docente con columnas de Match 1, Match 2...) en Excel (.xlsx)"
                 >
                   <Download className="h-3 w-3" />
                   <span>Excel</span>
@@ -3449,7 +3788,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   type="button"
                   onClick={() => handleExport("csv")}
                   className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-emerald-200 hover:text-white transition cursor-pointer"
-                  title="Descargar matriz con las columnas seleccionadas (.csv)"
+                  title="Descargar matriz en CSV (.csv)"
                 >
                   <FileText className="h-3 w-3" />
                   <span>CSV</span>
@@ -3464,7 +3803,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   type="button"
                   onClick={() => handleExportDetailed("excel")}
                   className="flex items-center gap-1 rounded-lg bg-indigo-600/40 px-2.5 py-1 text-xs font-semibold text-white hover:bg-indigo-600/60 transition cursor-pointer"
-                  title="Descargar listado relacional con las columnas seleccionadas (.xlsx)"
+                  title="Descargar listado relacional (1 fila por match profesor-asignatura) en Excel (.xlsx)"
                 >
                   <Download className="h-3 w-3" />
                   <span>Excel</span>
@@ -3473,7 +3812,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   type="button"
                   onClick={() => handleExportDetailed("csv")}
                   className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-indigo-200 hover:text-white transition cursor-pointer"
-                  title="Descargar listado relacional con las columnas seleccionadas (.csv)"
+                  title="Descargar listado relacional en CSV (.csv)"
                 >
                   <FileText className="h-3 w-3" />
                   <span>CSV</span>
@@ -3484,60 +3823,114 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
           {/* Panel Desplegable de Configuración de Columnas a Exportar */}
           {isExportConfigOpen && (
-            <div className="rounded-2xl border border-cyan-500/30 bg-slate-950/80 p-5 shadow-2xl backdrop-blur-md space-y-4 animate-in fade-in slide-in-from-top-2 duration-200">
+            <div className="rounded-2xl border border-cyan-500/40 bg-slate-950/90 p-5 shadow-2xl backdrop-blur-md space-y-4 animate-in fade-in slide-in-from-top-2 duration-200 ring-1 ring-cyan-500/20">
+              {/* Encabezado y Presets Rápidos */}
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
                 <div className="flex items-center gap-2">
-                  <SlidersHorizontal className="h-4 w-4 text-cyan-400" />
-                  <h4 className="text-sm font-bold text-white">
-                    Personalizar Columnas del Archivo de Matches
-                  </h4>
-                  <span className="text-xs text-slate-400">
-                    (Aplica a descargas en Excel y CSV tanto en Matriz como Detalle Par a Par)
-                  </span>
+                  <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                    <SlidersHorizontal className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      Personalizar Columnas del Archivo de Matches
+                      <span className="rounded-full bg-cyan-500/20 px-2 py-0.2 text-[10px] font-mono text-cyan-300 border border-cyan-500/30">
+                        {totalSelectedExportCols} activas
+                      </span>
+                    </h4>
+                    <p className="text-[11px] text-slate-400">
+                      Selecciona qué datos del docente, qué campos de asignatura y qué métricas por match se exportarán (aplica a Excel y CSV).
+                    </p>
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-slate-400 font-medium mr-1">Preajustes:</span>
                   <button
                     type="button"
                     onClick={selectAllExportCols}
                     className="rounded-lg border border-white/10 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
+                    title="Selecciona absolutamente todas las columnas disponibles"
                   >
-                    ✨ Seleccionar Todas
+                    ✨ Todas
                   </button>
                   <button
                     type="button"
-                    onClick={selectEssentialExportCols}
-                    className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20 transition cursor-pointer"
-                    title="Selecciona solo Nombre, Clave, Similitud y Rank para archivos ligeros"
+                    onClick={selectRecommendedExportCols}
+                    className="rounded-lg border border-cyan-500/40 bg-cyan-500/15 px-2.5 py-1 text-xs font-medium text-cyan-200 hover:bg-cyan-500/25 transition cursor-pointer font-semibold"
+                    title="Selecciona todos los datos descriptivos y métricas, excluyendo vectores pesados para un archivo ágil"
                   >
-                    🎯 Solo Esenciales (Ligero)
+                    🎯 Recomendadas (Ligero)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={selectMinimalExportCols}
+                    className="rounded-lg border border-white/10 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
+                    title="Selecciona únicamente Docente, Clave, Asignatura, Rank y Similitud"
+                  >
+                    ⚡ Mínimo Esencial
+                  </button>
+                  <button
+                    type="button"
+                    onClick={selectWithVectorsExportCols}
+                    className="rounded-lg border border-purple-500/30 bg-purple-500/10 px-2.5 py-1 text-xs font-medium text-purple-200 hover:bg-purple-500/20 transition cursor-pointer"
+                    title="Incluye además los vectores completos de 768 floats (embeddings) de docente y asignatura"
+                  >
+                    🧠 Con Embeddings 768d
                   </button>
                   <button
                     type="button"
                     onClick={deselectAllExportCols}
-                    className="rounded-lg border border-white/10 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-400 hover:bg-white/10 hover:text-rose-300 transition cursor-pointer"
+                    className="rounded-lg border border-white/10 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-400 hover:bg-rose-500/10 hover:text-rose-300 transition cursor-pointer"
+                    title="Deselecciona todas las columnas"
                   >
-                    🧹 Deseleccionar Todas
+                    🧹 Ninguna
                   </button>
                 </div>
               </div>
 
               {/* Input de Búsqueda Rápida de Columnas */}
-              <div className="relative max-w-sm">
-                <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500" />
-                <input
-                  type="text"
-                  placeholder="Filtrar columnas disponibles..."
-                  value={exportColSearchTerm}
-                  onChange={(e) => setExportColSearchTerm(e.target.value)}
-                  className="w-full rounded-lg border border-white/10 bg-slate-900 pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
-                />
+              <div className="flex items-center justify-between gap-3">
+                <div className="relative max-w-sm w-full">
+                  <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500" />
+                  <input
+                    type="text"
+                    placeholder="Filtrar columnas (ej. clave, correo, temario, embedding)..."
+                    value={exportColSearchTerm}
+                    onChange={(e) => setExportColSearchTerm(e.target.value)}
+                    className="w-full rounded-lg border border-white/10 bg-slate-900 pl-8 pr-7 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                  />
+                  {exportColSearchTerm && (
+                    <button
+                      type="button"
+                      onClick={() => setExportColSearchTerm("")}
+                      className="absolute right-2 top-2 text-slate-400 hover:text-white"
+                      title="Limpiar búsqueda"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <div className="text-[11px] text-slate-400 hidden sm:flex items-center gap-3">
+                  <span className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full bg-cyan-400"></span>
+                    <span>Docente ({totalSelectedDocenteCount})</span>
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400"></span>
+                    <span>Asignatura ({totalSelectedAsigCount})</span>
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full bg-indigo-400"></span>
+                    <span>Métricas ({totalSelectedMetricCount})</span>
+                  </span>
+                </div>
               </div>
 
-              {/* Grid de 3 Columnas: Docente, Asignatura, Métricas */}
+              {/* Grid de 3 Columnas: Docente, Asignatura por Match, Métricas */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
                 {/* 1. Columnas de Profesor / Docente */}
-                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-3.5 flex flex-col space-y-2.5">
+                <div className="rounded-xl border border-cyan-500/20 bg-slate-900/60 p-3.5 flex flex-col space-y-2.5">
                   <div className="flex items-center justify-between border-b border-white/5 pb-2">
                     <span className="font-bold text-cyan-300 flex items-center gap-1.5">
                       <Users className="h-3.5 w-3.5" />
@@ -3549,9 +3942,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedDocenteCols };
                           allAvailableDocenteCols.forEach((c) => { n[c.key] = true; });
-                          setSelectedDocenteCols(n);
+                          updateSelectedDocenteCols(() => n);
                         }}
-                        className="text-cyan-400 hover:underline cursor-pointer"
+                        className="text-cyan-400 hover:underline cursor-pointer font-medium"
                       >
                         Todas
                       </button>
@@ -3561,7 +3954,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedDocenteCols };
                           allAvailableDocenteCols.forEach((c) => { n[c.key] = false; });
-                          setSelectedDocenteCols(n);
+                          updateSelectedDocenteCols(() => n);
                         }}
                         className="text-slate-400 hover:underline cursor-pointer"
                       >
@@ -3570,7 +3963,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     </div>
                   </div>
 
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+                  <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
                     {allAvailableDocenteCols
                       .filter((c) => !exportColSearchTerm || c.label.toLowerCase().includes(exportColSearchTerm.toLowerCase()))
                       .map((col) => {
@@ -3588,7 +3981,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               type="checkbox"
                               checked={isChecked}
                               onChange={(e) => {
-                                setSelectedDocenteCols((prev) => ({
+                                updateSelectedDocenteCols((prev) => ({
                                   ...prev,
                                   [col.key]: e.target.checked,
                                 }));
@@ -3596,9 +3989,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               className="rounded border-white/20 bg-slate-950 text-cyan-500 focus:ring-cyan-500 h-3.5 w-3.5 cursor-pointer"
                             />
                             <span className="truncate flex-1 font-mono text-[11px]">{col.label}</span>
-                            {col.key === "Embedding Profesor" && (
-                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-sans">
-                                768 floats
+                            {col.isVector && (
+                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-sans font-semibold">
+                                768d
+                              </span>
+                            )}
+                            {col.isStandard && !col.isVector && (
+                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-sans">
+                                Estándar
                               </span>
                             )}
                           </label>
@@ -3607,12 +4005,12 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   </div>
                 </div>
 
-                {/* 2. Columnas de Asignatura */}
-                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-3.5 flex flex-col space-y-2.5">
+                {/* 2. Columnas de Asignatura (por cada Match) */}
+                <div className="rounded-xl border border-emerald-500/20 bg-slate-900/60 p-3.5 flex flex-col space-y-2.5">
                   <div className="flex items-center justify-between border-b border-white/5 pb-2">
                     <span className="font-bold text-emerald-300 flex items-center gap-1.5">
                       <BookOpen className="h-3.5 w-3.5" />
-                      Asignatura ({totalSelectedAsigCount}/{allAvailableAsigCols.length})
+                      Asignatura por Match ({totalSelectedAsigCount}/{allAvailableAsigCols.length})
                     </span>
                     <div className="flex items-center gap-1 text-[11px]">
                       <button
@@ -3620,9 +4018,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedAsigCols };
                           allAvailableAsigCols.forEach((c) => { n[c.key] = true; });
-                          setSelectedAsigCols(n);
+                          updateSelectedAsigCols(() => n);
                         }}
-                        className="text-emerald-400 hover:underline cursor-pointer"
+                        className="text-emerald-400 hover:underline cursor-pointer font-medium"
                       >
                         Todas
                       </button>
@@ -3632,7 +4030,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedAsigCols };
                           allAvailableAsigCols.forEach((c) => { n[c.key] = false; });
-                          setSelectedAsigCols(n);
+                          updateSelectedAsigCols(() => n);
                         }}
                         className="text-slate-400 hover:underline cursor-pointer"
                       >
@@ -3641,7 +4039,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     </div>
                   </div>
 
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+                  <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
                     {allAvailableAsigCols
                       .filter((c) => !exportColSearchTerm || c.label.toLowerCase().includes(exportColSearchTerm.toLowerCase()))
                       .map((col) => {
@@ -3659,7 +4057,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               type="checkbox"
                               checked={isChecked}
                               onChange={(e) => {
-                                setSelectedAsigCols((prev) => ({
+                                updateSelectedAsigCols((prev) => ({
                                   ...prev,
                                   [col.key]: e.target.checked,
                                 }));
@@ -3667,9 +4065,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               className="rounded border-white/20 bg-slate-950 text-emerald-500 focus:ring-emerald-500 h-3.5 w-3.5 cursor-pointer"
                             />
                             <span className="truncate flex-1 font-mono text-[11px]">{col.label}</span>
-                            {col.key === "Embedding Asignatura" && (
-                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-sans">
-                                768 floats
+                            {col.isVector && (
+                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-sans font-semibold">
+                                768d
+                              </span>
+                            )}
+                            {col.isStandard && !col.isVector && (
+                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-sans">
+                                Estándar
                               </span>
                             )}
                           </label>
@@ -3679,7 +4082,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 </div>
 
                 {/* 3. Métricas y Desgloses de Matching */}
-                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-3.5 flex flex-col space-y-2.5">
+                <div className="rounded-xl border border-indigo-500/20 bg-slate-900/60 p-3.5 flex flex-col space-y-2.5">
                   <div className="flex items-center justify-between border-b border-white/5 pb-2">
                     <span className="font-bold text-indigo-300 flex items-center gap-1.5">
                       <BarChart3 className="h-3.5 w-3.5" />
@@ -3691,9 +4094,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedMetricCols };
                           availableMetricCols.forEach((c) => { n[c.key] = true; });
-                          setSelectedMetricCols(n);
+                          updateSelectedMetricCols(() => n);
                         }}
-                        className="text-indigo-400 hover:underline cursor-pointer"
+                        className="text-indigo-400 hover:underline cursor-pointer font-medium"
                       >
                         Todas
                       </button>
@@ -3703,7 +4106,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         onClick={() => {
                           const n: Record<string, boolean> = { ...selectedMetricCols };
                           availableMetricCols.forEach((c) => { n[c.key] = false; });
-                          setSelectedMetricCols(n);
+                          updateSelectedMetricCols(() => n);
                         }}
                         className="text-slate-400 hover:underline cursor-pointer"
                       >
@@ -3712,7 +4115,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     </div>
                   </div>
 
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+                  <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
                     {availableMetricCols
                       .filter((c) => !exportColSearchTerm || c.label.toLowerCase().includes(exportColSearchTerm.toLowerCase()))
                       .map((metric) => {
@@ -3730,7 +4133,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               type="checkbox"
                               checked={isChecked}
                               onChange={(e) => {
-                                setSelectedMetricCols((prev) => ({
+                                updateSelectedMetricCols((prev) => ({
                                   ...prev,
                                   [metric.key]: e.target.checked,
                                 }));
@@ -3745,6 +4148,82 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 </div>
               </div>
 
+              {/* ── Vista Previa en Vivo de las Columnas Resultantes en el Archivo ── */}
+              <div className="rounded-xl border border-white/10 bg-slate-900/40 p-3.5 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Table className="h-4 w-4 text-cyan-400" />
+                    <span className="text-xs font-bold text-white">
+                      Vista Previa de Columnas en el Archivo Generado
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      ({exportPreviewLayout === "matriz" ? matrixPreviewHeaders.length : detailedPreviewHeaders.length} columnas en este ejemplo)
+                    </span>
+                  </div>
+
+                  {/* Switcher de Vista Previa entre Matriz y Detalle */}
+                  <div className="flex items-center bg-slate-950 p-0.5 rounded-lg border border-white/10 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setExportPreviewLayout("matriz")}
+                      className={`px-2.5 py-1 rounded-md transition cursor-pointer font-medium ${
+                        exportPreviewLayout === "matriz"
+                          ? "bg-emerald-500/20 text-emerald-300 font-semibold"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Formato Matriz (1 Fila/Docente)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExportPreviewLayout("detailed")}
+                      className={`px-2.5 py-1 rounded-md transition cursor-pointer font-medium ${
+                        exportPreviewLayout === "detailed"
+                          ? "bg-indigo-500/20 text-indigo-300 font-semibold"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Formato Detalle (1 Fila/Match)
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px] scrollbar-thin">
+                  {(exportPreviewLayout === "matriz" ? matrixPreviewHeaders : detailedPreviewHeaders).length === 0 ? (
+                    <span className="text-rose-400 text-xs py-1">
+                      ⚠️ No has seleccionado ninguna columna. Selecciona al menos una columna para poder exportar.
+                    </span>
+                  ) : (
+                    <>
+                      {(exportPreviewLayout === "matriz" ? matrixPreviewHeaders : detailedPreviewHeaders).map((h, idx) => {
+                        const colorClass =
+                          h.category === "docente"
+                            ? "bg-cyan-500/15 border-cyan-500/30 text-cyan-200"
+                            : h.category === "asig"
+                            ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-200"
+                            : h.category === "vector"
+                            ? "bg-purple-500/20 border-purple-500/30 text-purple-200"
+                            : "bg-indigo-500/15 border-indigo-500/30 text-indigo-200";
+
+                        return (
+                          <span
+                            key={idx}
+                            className={`whitespace-nowrap px-2.5 py-1 rounded-md border font-mono text-[10px] font-medium shrink-0 ${colorClass}`}
+                          >
+                            {h.name}
+                          </span>
+                        );
+                      })}
+                      {exportPreviewLayout === "matriz" && (
+                        <span className="text-[10px] text-slate-500 whitespace-nowrap italic px-2">
+                          + columnas repetidas para Match 2, Match 3, ...
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+
               {/* Footer con resumen y atajos directos de descarga */}
               <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-white/10 bg-slate-900/60 p-3 rounded-xl">
                 <span className="text-xs text-slate-300">
@@ -3755,18 +4234,49 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   <button
                     type="button"
                     onClick={() => handleExportDetailed("excel")}
-                    className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1 text-xs font-semibold text-white hover:bg-indigo-500 transition cursor-pointer shadow"
+                    disabled={totalSelectedExportCols === 0}
+                    className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500 transition cursor-pointer shadow disabled:opacity-40"
+                    title="Descargar listado relacional con las columnas seleccionadas (.xlsx)"
                   >
                     <Download className="h-3 w-3" />
                     <span>Descargar Detalle (.xlsx)</span>
                   </button>
                   <button
                     type="button"
+                    onClick={() => handleExportDetailed("csv")}
+                    disabled={totalSelectedExportCols === 0}
+                    className="flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/15 px-2.5 py-1.5 text-xs font-semibold text-indigo-200 hover:bg-indigo-500/30 transition cursor-pointer shadow disabled:opacity-40"
+                    title="Descargar listado relacional con las columnas seleccionadas (.csv)"
+                  >
+                    <FileText className="h-3 w-3" />
+                    <span>Detalle (.csv)</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => handleExport("excel")}
-                    className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 transition cursor-pointer shadow"
+                    disabled={totalSelectedExportCols === 0}
+                    className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 transition cursor-pointer shadow disabled:opacity-40"
+                    title="Descargar matriz con las columnas seleccionadas (.xlsx)"
                   >
                     <Download className="h-3 w-3" />
                     <span>Descargar Matriz (.xlsx)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleExport("csv")}
+                    disabled={totalSelectedExportCols === 0}
+                    className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/15 px-2.5 py-1.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/30 transition cursor-pointer shadow disabled:opacity-40"
+                    title="Descargar matriz con las columnas seleccionadas (.csv)"
+                  >
+                    <FileText className="h-3 w-3" />
+                    <span>Matriz (.csv)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsExportConfigOpen(false)}
+                    className="rounded-lg border border-white/10 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
+                  >
+                    Listo / Cerrar
                   </button>
                 </div>
               </div>
@@ -3958,11 +4468,38 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                         )}
 
                         {hasMatches ? (
-                          <div
-                            className={`flex items-center gap-1.5 rounded-xl border px-3 py-1 text-xs font-bold font-mono ${scoreColor}`}
-                          >
-                            <Sparkles className="h-3 w-3" />
-                            <span>Top: {(topScore * 100).toFixed(1)}%</span>
+                          <div className="flex items-center gap-2">
+                            <div
+                              className={`flex items-center gap-1.5 rounded-xl border px-3 py-1 text-xs font-bold font-mono ${scoreColor}`}
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              <span>Top: {(topScore * 100).toFixed(1)}%</span>
+                            </div>
+
+                            {/* Exportar únicamente este profesor con las columnas seleccionadas */}
+                            <div
+                              className="hidden sm:flex items-center bg-slate-900 border border-white/10 rounded-lg p-0.5"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => handleExportSingleProfessor(result, "excel", "detailed")}
+                                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold text-emerald-300 hover:bg-emerald-500/20 transition cursor-pointer"
+                                title="Exportar asignaturas de este docente a Excel (.xlsx) con las columnas configuradas"
+                              >
+                                <Download className="h-2.5 w-2.5" />
+                                <span>Excel</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleExportSingleProfessor(result, "csv", "detailed")}
+                                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold text-cyan-300 hover:bg-cyan-500/20 transition cursor-pointer"
+                                title="Exportar asignaturas de este docente a CSV (.csv) con las columnas configuradas"
+                              >
+                                <FileText className="h-2.5 w-2.5" />
+                                <span>CSV</span>
+                              </button>
+                            </div>
                           </div>
                         ) : (
                           <span className="rounded-xl border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-400">
