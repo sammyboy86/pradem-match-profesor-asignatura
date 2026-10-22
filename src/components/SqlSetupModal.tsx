@@ -45,7 +45,11 @@ CREATE INDEX IF NOT EXISTS idx_asignaturas_vectors_gin
 ON public.asignaturas 
 USING gin (vectors);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_asignaturas_clave ON public.asignaturas(clave);
+-- 3.1 Remover restricción única en clave para permitir materias con la misma clave (diferentes grupos/planes)
+DROP INDEX IF EXISTS idx_asignaturas_clave;
+ALTER TABLE public.asignaturas DROP CONSTRAINT IF EXISTS asignaturas_clave_key;
+ALTER TABLE public.asignaturas DROP CONSTRAINT IF EXISTS idx_asignaturas_clave;
+CREATE INDEX IF NOT EXISTS idx_asignaturas_clave ON public.asignaturas(clave);
 CREATE INDEX IF NOT EXISTS idx_asignaturas_nombre ON public.asignaturas(nombre);
 CREATE INDEX IF NOT EXISTS idx_asignaturas_cluster ON public.asignaturas(cluster);
 
@@ -92,7 +96,38 @@ BEGIN
   ORDER BY a.embedding_768 <=> query_embedding ASC
   LIMIT match_count;
 END;
-$$;`;
+$$;
+
+-- 7. Función RPC para agregar columnas dinámicamente desde la app
+CREATE OR REPLACE FUNCTION public.add_asignatura_column(col_name TEXT, col_type TEXT DEFAULT 'TEXT')
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  clean_col TEXT;
+  clean_type TEXT;
+BEGIN
+  clean_col := lower(regexp_replace(col_name, '[^a-zA-Z0-9_]', '_', 'g'));
+  clean_col := trim(both '_' from clean_col);
+  IF clean_col IS NULL OR length(clean_col) = 0 THEN
+    RETURN FALSE;
+  END IF;
+
+  clean_type := upper(trim(col_type));
+  IF clean_type NOT IN ('TEXT', 'VARCHAR', 'INTEGER', 'BIGINT', 'REAL', 'DOUBLE PRECISION', 'BOOLEAN', 'TIMESTAMPTZ', 'JSONB') THEN
+    clean_type := 'TEXT';
+  END IF;
+
+  EXECUTE format('ALTER TABLE public.asignaturas ADD COLUMN IF NOT EXISTS %I %s;', clean_col, clean_type);
+  RETURN TRUE;
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN FALSE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.add_asignatura_column(TEXT, TEXT) TO anon, authenticated, service_role;`;
 
 export default function SqlSetupModal({
   isOpen,

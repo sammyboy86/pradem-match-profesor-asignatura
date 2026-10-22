@@ -268,7 +268,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ── CARGA MULTI-VECTOR DE ASIGNATURAS CANDIDATAS ──
-    // Cargamos asignaturas objetivo (filtradas o catálogo completo) con todas sus columnas de vectores
+    // Cargamos asignaturas objetivo (filtradas o catálogo completo) con TODAS sus columnas
     interface TargetAsignatura {
       id: number;
       clave: string;
@@ -278,34 +278,20 @@ export async function POST(req: NextRequest) {
       match_nombre: boolean;
       vectorsMap: Record<string, number[]>;
       primaryEmbedding: number[] | null;
+      allColumns: Record<string, any>;
     }
-
-    const selectColumns = `id, clave, nombre, contenido_tematico, match_nombre, embedding_768, vectors, cluster${
-      clusterColumn && clusterColumn !== "cluster" ? `, ${clusterColumn}` : ""
-    }`;
 
     let targetRows: any[] = [];
     try {
-      let queryBuilder = supabase.from("asignaturas").select(selectColumns);
+      let queryBuilder = supabase.from("asignaturas").select("*");
       if (hasFilter) {
         queryBuilder = queryBuilder.in("id", filterAsignaturaIds);
       }
       const { data, error } = await queryBuilder;
       if (error) {
-        // Fallback si la columna 'vectors' no existe aún en la base de datos
-        if (error.message?.includes("vectors") || error.code === "42703") {
-          const fallbackCols = selectColumns.replace(", vectors", "").replace("vectors,", "");
-          let fbQuery = supabase.from("asignaturas").select(fallbackCols);
-          if (hasFilter) fbQuery = fbQuery.in("id", filterAsignaturaIds);
-          const { data: fbData, error: fbErr } = await fbQuery;
-          if (fbErr) throw fbErr;
-          targetRows = fbData || [];
-        } else {
-          throw error;
-        }
-      } else {
-        targetRows = data || [];
+        throw error;
       }
+      targetRows = data || [];
     } catch (fetchErr: any) {
       throw new Error(`Error al consultar asignaturas en Supabase: ${fetchErr.message}`);
     }
@@ -375,6 +361,14 @@ export async function POST(req: NextRequest) {
         const rawClusterVal = r[clusterColumn] !== undefined ? r[clusterColumn] : r.cluster;
         const cleanCluster = rawClusterVal != null && String(rawClusterVal).trim() !== "" ? String(rawClusterVal).trim() : null;
 
+        // Extraer todos los campos de la fila de la asignatura (excluyendo arrays crudos de vectores)
+        const allColumns: Record<string, any> = {};
+        Object.entries(r).forEach(([k, v]) => {
+          if (k !== "embedding_768" && k !== "vectors") {
+            allColumns[k] = v;
+          }
+        });
+
         return {
           id: r.id,
           clave: r.clave || "",
@@ -384,6 +378,7 @@ export async function POST(req: NextRequest) {
           match_nombre: Boolean(r.match_nombre),
           vectorsMap,
           primaryEmbedding: primaryEmb,
+          allColumns,
         };
       })
       .filter((a) => Object.keys(a.vectorsMap).length > 0);
@@ -446,11 +441,14 @@ export async function POST(req: NextRequest) {
 
           if (passesFilter) {
             scoredItems.push({
+              ...target.allColumns,
               asignaturaId: target.id,
               clave: target.clave,
               nombre: target.nombre,
               cluster: target.cluster,
               contenido_tematico: target.contenido_tematico,
+              fines_de_aprendizaje_o_formacion: target.allColumns.fines_de_aprendizaje_o_formacion,
+              actividades_de_aprendizaje: target.allColumns.actividades_de_aprendizaje,
               compositeSimilarity: Number(compositeSim.toFixed(4)),
               fieldSimilarities: pairSims,
               pairSimilarities: pairSims,

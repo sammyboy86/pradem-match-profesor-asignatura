@@ -94,13 +94,16 @@ export interface MatchResultItem {
   clave: string;
   nombre: string;
   cluster?: string | null;
-  contenido_tematico: string;
+  contenido_tematico?: string | null;
+  fines_de_aprendizaje_o_formacion?: string | null;
+  actividades_de_aprendizaje?: string | null;
   compositeSimilarity: number;
   fieldSimilarities: Record<string, number>;
   pairSimilarities?: Record<string, number>;
   match_nombre?: boolean;
   embedding_768?: number[] | null;
   vectors?: Record<string, number[]> | null;
+  [key: string]: any;
 }
 
 export interface ProfesorMatchResult {

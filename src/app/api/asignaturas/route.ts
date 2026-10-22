@@ -119,6 +119,27 @@ export async function GET(req: NextRequest) {
       };
     });
 
+    // Descubrir todas las columnas presentes en la tabla
+    const allDiscoveredCols = new Set<string>([
+      "id",
+      "clave",
+      "nombre",
+      "cluster",
+      "fines_de_aprendizaje_o_formacion",
+      "contenido_tematico",
+      "actividades_de_aprendizaje",
+      "match_nombre",
+      "match_semantico",
+      "dot_product_match",
+      "embedding_768",
+      "vectors",
+      "created_at",
+    ]);
+
+    (records || []).forEach((r) => {
+      Object.keys(r).forEach((k) => allDiscoveredCols.add(k));
+    });
+
     return NextResponse.json({
       success: true,
       tableExists: true,
@@ -126,6 +147,7 @@ export async function GET(req: NextRequest) {
       withEmbeddingCount: withEmbeddingCount || 0,
       withoutEmbeddingCount: Math.max(0, withoutEmbeddingCount),
       availableVectorColumns: Array.from(allKnownVectorCols),
+      availableColumns: Array.from(allDiscoveredCols),
       records: sanitizedRecords,
     });
   } catch (error: any) {
@@ -145,7 +167,7 @@ export async function POST(req: NextRequest) {
     const supabase = createDirectServerClient();
     const body = await req.json().catch(() => ({}));
     const asignaturas: Asignatura[] = body.asignaturas || [];
-    const mode: "insert" | "upsert" = body.mode || "upsert";
+    const mode: "insert" | "upsert" = body.mode || "insert";
 
     if (!Array.isArray(asignaturas) || asignaturas.length === 0) {
       return NextResponse.json(
@@ -177,6 +199,50 @@ export async function POST(req: NextRequest) {
       }
     } catch {
       // Ignorar si la tabla está vacía
+    }
+
+    // Detectar si hay nuevas columnas en las asignaturas que no están en tableColumns
+    const candidateCustomCols = new Set<string>();
+    asignaturas.forEach((a) => {
+      Object.keys(a).forEach((rawKey) => {
+        if (rawKey === "vectors" || rawKey === "id" || rawKey === "created_at") return;
+        const normKey = rawKey
+          .trim()
+          .toLowerCase()
+          .replace(/[\s-]+/g, "_")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-z0-9_]/g, "_")
+          .replace(/^_+|_+$/g, "");
+
+        if (
+          normKey &&
+          !tableColumns.has(normKey) &&
+          !normKey.startsWith("vector_") &&
+          !normKey.startsWith("embedding_") &&
+          !normKey.endsWith("_vector") &&
+          !normKey.endsWith("_embedding")
+        ) {
+          candidateCustomCols.add(normKey);
+        }
+      });
+    });
+
+    // Intentar crear automáticamente las nuevas columnas en Supabase vía RPC add_asignatura_column
+    if (candidateCustomCols.size > 0) {
+      for (const col of candidateCustomCols) {
+        try {
+          const { error: rpcErr } = await supabase.rpc("add_asignatura_column", {
+            col_name: col,
+            col_type: "TEXT",
+          });
+          if (!rpcErr) {
+            tableColumns.add(col);
+          }
+        } catch {
+          // Ignorar si el RPC no está disponible
+        }
+      }
     }
 
     // Limpiar y preparar payload con soporte multi-vector
@@ -306,44 +372,47 @@ export async function POST(req: NextRequest) {
 
     let result;
     const executeSave = async (dataPayload: any[]) => {
+      // Si explícitamente se solicita upsert y los registros cuentan con 'id' de base de datos
       if (mode === "upsert") {
-        let res = await supabase
-          .from("asignaturas")
-          .upsert(dataPayload, { onConflict: "clave" })
-          .select("id, clave, nombre");
-
-        if (
-          res.error &&
-          (res.error.code === "42P10" ||
-            res.error.message?.includes("unique or exclusion constraint") ||
-            res.error.message?.includes("ON CONFLICT"))
-        ) {
-          console.warn("Fallback automático a insert:", res.error.message);
-          res = await supabase
+        const hasIds = dataPayload.some((item) => item.id != null);
+        if (hasIds) {
+          return await supabase
             .from("asignaturas")
-            .insert(dataPayload)
+            .upsert(dataPayload, { onConflict: "id" })
             .select("id, clave, nombre");
         }
-        return res;
-      } else {
-        return await supabase
-          .from("asignaturas")
-          .insert(dataPayload)
-          .select("id, clave, nombre");
       }
+
+      // Por defecto para carga de asignaturas: insertar como nuevo registro (permite claves repetidas)
+      return await supabase
+        .from("asignaturas")
+        .insert(dataPayload)
+        .select("id, clave, nombre");
     };
 
     result = await executeSave(payload);
 
-    // Si falló debido a que la columna 'vectors' no existe aún en Supabase, reintentar sin el campo vectors
-    if (result.error && (result.error.message?.includes("vectors") || result.error.code === "42703")) {
-      console.warn("La columna 'vectors' no existe aún en Supabase. Reintentando guardado con embedding_768...");
-      const strippedPayload = payload.map((p) => {
-        const copy = { ...p };
-        delete copy.vectors;
-        return copy;
-      });
-      result = await executeSave(strippedPayload);
+    // Si falló debido a columnas inexistentes (código 42703 o mensaje "does not exist"), reintentar retirando la columna causante
+    let retryPayload = [...payload];
+    let maxRetries = 5;
+    while (result.error && (result.error.code === "42703" || result.error.message?.includes("does not exist")) && maxRetries > 0) {
+      maxRetries--;
+      const colMatch =
+        result.error.message.match(/column "?([a-zA-Z0-9_]+)"? of relation/i) ||
+        result.error.message.match(/column "?([a-zA-Z0-9_]+)"? does not exist/i);
+      const badCol = colMatch ? colMatch[1].toLowerCase() : (result.error.message.includes("vectors") ? "vectors" : null);
+
+      if (badCol) {
+        console.warn(`Columna '${badCol}' no existe en Supabase. Reintentando guardado sin esta columna...`);
+        retryPayload = retryPayload.map((p) => {
+          const copy = { ...p };
+          delete copy[badCol];
+          return copy;
+        });
+        result = await executeSave(retryPayload);
+      } else {
+        break;
+      }
     }
 
     if (result.error) {

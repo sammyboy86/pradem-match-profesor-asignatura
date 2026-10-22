@@ -1183,30 +1183,89 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   }, [matchResults, filterOnlyWithMatches, searchFilter]);
 
   // ── Exportación a Excel (.xlsx) y CSV con Embeddings (Profesor y Asignatura) ──
+  // Descubrir todas las columnas adicionales de asignaturas presentes en los resultados
+  const getAsignaturaExtraColumns = () => {
+    const allAsigExtraCols = new Set<string>();
+    const standardAsigKeys = new Set([
+      "id",
+      "asignaturaId",
+      "clave",
+      "nombre",
+      "cluster",
+      "contenido_tematico",
+      "fines_de_aprendizaje_o_formacion",
+      "actividades_de_aprendizaje",
+      "match_nombre",
+      "match_semantico",
+      "dot_product_match",
+      "embedding_768",
+      "vectors",
+      "compositeSimilarity",
+      "fieldSimilarities",
+      "pairSimilarities",
+      "created_at",
+    ]);
+
+    matchResults.forEach((r) => {
+      r.matches.forEach((m) => {
+        Object.keys(m).forEach((k) => {
+          if (!standardAsigKeys.has(k) && !k.startsWith("vector_") && !k.startsWith("embedding_")) {
+            allAsigExtraCols.add(k);
+          }
+        });
+      });
+    });
+
+    return Array.from(allAsigExtraCols);
+  };
+
+  // ── Exportación Matriz a Excel (.xlsx) y CSV (1 Fila por Docente con Todas las Columnas) ──
   const handleExport = (format: "excel" | "csv") => {
     if (!matchResults.length) return;
 
+    const extraAsigCols = getAsignaturaExtraColumns();
+
     // Aplanar los resultados para formato tabular estructurado
     const rows = matchResults.map((item) => {
-      const rowData: Record<string, any> = {
-        "ID Profesor": item.profesor.id,
-        "Nombre Profesor": item.profesor.nombre_profesor,
-      };
+      const rowData: Record<string, any> = {};
 
-      // Incluir campos del profesor (versión sanitizada si se mitigó el sesgo)
-      fileHeaders.forEach((h) => {
-        if (h !== nameColumn) {
-          let val = item.profesor[h] ?? "";
-          if (
-            item.sanitizationStatus === "sanitized" &&
-            typeof val === "string" &&
-            regexFilterConfig?.enabled
-          ) {
-            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
-            val = res.sanitizedText;
-          }
-          rowData[h] = val;
+      // 1. Incluir TODAS las columnas del docente
+      const handledDocenteKeys = new Set<string>();
+
+      rowData["ID Profesor"] = item.profesor.id ?? "";
+      rowData["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
+      handledDocenteKeys.add("id");
+      handledDocenteKeys.add("ID Profesor");
+      handledDocenteKeys.add("nombre_profesor");
+      handledDocenteKeys.add("Nombre Profesor");
+      if (nameColumn) handledDocenteKeys.add(nameColumn);
+
+      // Recopilar todas las columnas del archivo o del objeto profesor
+      const allDocenteCols = new Set<string>();
+      fileHeaders.forEach((h) => allDocenteCols.add(h));
+      Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
+
+      allDocenteCols.forEach((col) => {
+        if (
+          handledDocenteKeys.has(col) ||
+          col === "embedding_768" ||
+          col === "vectors" ||
+          col === "fieldEmbeddings"
+        ) {
+          return;
         }
+
+        let val = item.profesor[col] ?? "";
+        if (
+          item.sanitizationStatus === "sanitized" &&
+          typeof val === "string" &&
+          regexFilterConfig?.enabled
+        ) {
+          const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+          val = res.sanitizedText;
+        }
+        rowData[col] = val;
+        handledDocenteKeys.add(col);
       });
 
       // Embedding 768d del Profesor (Vector compuesto multimodal)
@@ -1241,7 +1300,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           : topK
       );
 
-      // Desglosar cada una de las recomendaciones ordenadas de mayor a menor
+      // Desglosar cada una de las recomendaciones con TODAS sus columnas de asignatura
       for (let k = 0; k < maxMatchesToExport; k++) {
         const m = item.matches[k];
         const prefix = `Match ${k + 1}`;
@@ -1270,6 +1329,17 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             .join(" | ");
           rowData[`${prefix} - Desglose`] = desglose;
 
+          // Todas las columnas de contenido y formación de la Asignatura
+          rowData[`${prefix} - Contenido Temático`] = m.contenido_tematico || "";
+          rowData[`${prefix} - Fines de Aprendizaje`] = m.fines_de_aprendizaje_o_formacion || "";
+          rowData[`${prefix} - Actividades de Aprendizaje`] = m.actividades_de_aprendizaje || "";
+
+          // Columnas adicionales dinámicas de la Asignatura
+          extraAsigCols.forEach((extraCol) => {
+            const label = extraCol.replace(/_/g, " ");
+            rowData[`${prefix} - ${label}`] = m[extraCol] ?? "";
+          });
+
           // Embedding principal 768d de la Asignatura recomendada
           rowData[`${prefix} - Embedding Asignatura`] = formatEmbeddingForExport(m.embedding_768);
 
@@ -1283,9 +1353,17 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           rowData[`${prefix} - Asignatura`] = "—";
           rowData[`${prefix} - Clave`] = "—";
           rowData[`${prefix} - Cluster`] = "—";
+          rowData[`${prefix} - Tipo`] = "—";
           rowData[`${prefix} - Similitud Compuesta`] = "—";
           rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = "—";
           rowData[`${prefix} - Desglose`] = "—";
+          rowData[`${prefix} - Contenido Temático`] = "—";
+          rowData[`${prefix} - Fines de Aprendizaje`] = "—";
+          rowData[`${prefix} - Actividades de Aprendizaje`] = "—";
+          extraAsigCols.forEach((extraCol) => {
+            const label = extraCol.replace(/_/g, " ");
+            rowData[`${prefix} - ${label}`] = "—";
+          });
           rowData[`${prefix} - Embedding Asignatura`] = "—";
         }
       }
@@ -1293,7 +1371,145 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       return rowData;
     });
 
-    const filename = `Match_Profesores_Asignaturas_con_Embeddings_${new Date().toISOString().slice(0, 10)}`;
+    const filename = `Match_Matriz_Docentes_Asignaturas_${new Date().toISOString().slice(0, 10)}`;
+    if (format === "excel") {
+      exportToExcel(rows, filename);
+    } else {
+      exportToCsv(rows, filename);
+    }
+  };
+
+  // ── Exportación Detallada Par a Par (1 Fila por Match con Todas las Columnas de Docente y Asignatura) ──
+  const handleExportDetailed = (format: "excel" | "csv") => {
+    if (!matchResults.length) return;
+
+    const extraAsigCols = getAsignaturaExtraColumns();
+    const rows: Record<string, any>[] = [];
+
+    matchResults.forEach((item) => {
+      // Helper para extraer todas las columnas del docente
+      const extractDocenteData = () => {
+        const d: Record<string, any> = {};
+        const handledDocenteKeys = new Set<string>();
+
+        d["ID Profesor"] = item.profesor.id ?? "";
+        d["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
+        handledDocenteKeys.add("id");
+        handledDocenteKeys.add("ID Profesor");
+        handledDocenteKeys.add("nombre_profesor");
+        handledDocenteKeys.add("Nombre Profesor");
+        if (nameColumn) handledDocenteKeys.add(nameColumn);
+
+        const allDocenteCols = new Set<string>();
+        fileHeaders.forEach((h) => allDocenteCols.add(h));
+        Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
+
+        allDocenteCols.forEach((col) => {
+          if (
+            handledDocenteKeys.has(col) ||
+            col === "embedding_768" ||
+            col === "vectors" ||
+            col === "fieldEmbeddings"
+          ) {
+            return;
+          }
+
+          let val = item.profesor[col] ?? "";
+          if (
+            item.sanitizationStatus === "sanitized" &&
+            typeof val === "string" &&
+            regexFilterConfig?.enabled
+          ) {
+            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+            val = res.sanitizedText;
+          }
+          d[col] = val;
+          handledDocenteKeys.add(col);
+        });
+
+        d["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+        return d;
+      };
+
+      const baseDocenteData = extractDocenteData();
+
+      // Si el profesor no tuvo asignaturas sobre el umbral
+      if (!item.matches.length) {
+        const emptyRow: Record<string, any> = {
+          ...baseDocenteData,
+          "Rank Match": "—",
+          "Similitud Compuesta": "Sin matches",
+          "Tipo Match": "—",
+          "Desglose Pares (Multi-Vector)": "—",
+          "Desglose Criterios": "—",
+          "ID Asignatura": "—",
+          "Clave Asignatura": "—",
+          "Nombre Asignatura": "—",
+          "Cluster Asignatura": "—",
+          "Contenido Temático": "—",
+          "Fines de Aprendizaje": "—",
+          "Actividades de Aprendizaje": "—",
+        };
+        extraAsigCols.forEach((c) => {
+          emptyRow[`Asignatura - ${c.replace(/_/g, " ")}`] = "—";
+        });
+        emptyRow["Embedding Asignatura"] = "—";
+        rows.push(emptyRow);
+        return;
+      }
+
+      // 1 fila por cada match par a par con todas las columnas
+      item.matches.forEach((m, idx) => {
+        const rowData: Record<string, any> = {
+          ...baseDocenteData,
+          "Rank Match": `#${idx + 1}`,
+          "Similitud Compuesta": `${(m.compositeSimilarity * 100).toFixed(1)}%`,
+          "Tipo Match": m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico",
+        };
+
+        if (m.pairSimilarities && Object.keys(m.pairSimilarities).length > 0) {
+          const desglosePares = Object.entries(m.pairSimilarities)
+            .map(([pairKey, score]) => {
+              const pairCfg = distancePairs.find((p) => p.id === pairKey);
+              const label = pairCfg?.label || pairKey;
+              return `${label}: ${(score * 100).toFixed(0)}%`;
+            })
+            .join(" | ");
+          rowData["Desglose Pares (Multi-Vector)"] = desglosePares;
+        }
+
+        const desglose = Object.entries(m.fieldSimilarities)
+          .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
+          .join(" | ");
+        rowData["Desglose Criterios"] = desglose;
+
+        // Todas las columnas de la asignatura
+        rowData["ID Asignatura"] = m.asignaturaId ?? m.id ?? "";
+        rowData["Clave Asignatura"] = m.clave ?? "";
+        rowData["Nombre Asignatura"] = m.nombre ?? "";
+        rowData["Cluster Asignatura"] = m.cluster || "Sin Cluster";
+        rowData["Contenido Temático"] = m.contenido_tematico || "";
+        rowData["Fines de Aprendizaje"] = m.fines_de_aprendizaje_o_formacion || "";
+        rowData["Actividades de Aprendizaje"] = m.actividades_de_aprendizaje || "";
+
+        // Columnas personalizadas / dinámicas
+        extraAsigCols.forEach((extraCol) => {
+          rowData[`Asignatura - ${extraCol.replace(/_/g, " ")}`] = m[extraCol] ?? "";
+        });
+
+        // Embeddings de la asignatura
+        rowData["Embedding Asignatura"] = formatEmbeddingForExport(m.embedding_768);
+        if (m.vectors && typeof m.vectors === "object") {
+          Object.entries(m.vectors).forEach(([vCol, vVec]) => {
+            rowData[`Vector Asignatura (${vCol})`] = formatEmbeddingForExport(vVec);
+          });
+        }
+
+        rows.push(rowData);
+      });
+    });
+
+    const filename = `Match_Detallado_Docente_Asignatura_${new Date().toISOString().slice(0, 10)}`;
     if (format === "excel") {
       exportToExcel(rows, filename);
     } else {
@@ -2994,27 +3210,55 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               </p>
             </div>
 
-            {/* Botones de Exportación */}
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleExport("excel")}
-                className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20 transition shadow-sm cursor-pointer"
-                title="Descargar matriz con embeddings 768d de profesores y asignaturas (.xlsx)"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Exportar Excel (.xlsx)</span>
-              </button>
+            {/* Botones de Exportación: Matriz y Detalle Par a Par con todas las columnas */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="flex items-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-0.5 shadow-sm">
+                <span className="px-2.5 py-1 text-[11px] font-semibold text-emerald-300">
+                  Matriz (1 fila/docente):
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleExport("excel")}
+                  className="flex items-center gap-1 rounded-lg bg-emerald-600/30 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-600/50 transition cursor-pointer"
+                  title="Descargar matriz con todas las columnas de docente y asignaturas (.xlsx)"
+                >
+                  <Download className="h-3 w-3" />
+                  <span>Excel</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExport("csv")}
+                  className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-emerald-200 hover:text-white transition cursor-pointer"
+                  title="Descargar matriz con todas las columnas de docente y asignaturas (.csv)"
+                >
+                  <FileText className="h-3 w-3" />
+                  <span>CSV</span>
+                </button>
+              </div>
 
-              <button
-                type="button"
-                onClick={() => handleExport("csv")}
-                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3.5 py-2 text-xs font-semibold text-slate-300 hover:bg-white/10 hover:text-white transition cursor-pointer"
-                title="Descargar archivo CSV con vectores de 768 dimensiones (.csv)"
-              >
-                <FileText className="h-3.5 w-3.5" />
-                <span>Exportar CSV</span>
-              </button>
+              <div className="flex items-center rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-0.5 shadow-sm">
+                <span className="px-2.5 py-1 text-[11px] font-semibold text-indigo-300">
+                  Detalle Par a Par:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleExportDetailed("excel")}
+                  className="flex items-center gap-1 rounded-lg bg-indigo-600/40 px-2.5 py-1 text-xs font-semibold text-white hover:bg-indigo-600/60 transition cursor-pointer"
+                  title="Descargar listado relacional con cada columna de docente y asignatura una al lado de la otra (.xlsx)"
+                >
+                  <Download className="h-3 w-3" />
+                  <span>Excel</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportDetailed("csv")}
+                  className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-indigo-200 hover:text-white transition cursor-pointer"
+                  title="Descargar listado relacional con cada columna de docente y asignatura una al lado de la otra (.csv)"
+                >
+                  <FileText className="h-3 w-3" />
+                  <span>CSV</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -3271,39 +3515,44 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               })}
                           </div>
 
-                          {/* Otros campos del archivo si existen y no fueron usados en matching */}
-                          {fileHeaders.filter(
-                            (h) =>
-                              h !== nameColumn &&
-                              !queryConfigs.some((c) => c.active && c.field === h) &&
-                              result.profesor[h]
-                          ).length > 0 && (
-                            <details className="text-xs group pt-1">
-                              <summary className="text-[11px] text-slate-400 cursor-pointer hover:text-slate-200 transition select-none flex items-center gap-1">
-                                <span className="underline">Ver otros datos del docente</span>
-                                <span className="text-[10px] text-slate-500">
-                                  ({fileHeaders.filter((h) => h !== nameColumn && !queryConfigs.some((c) => c.active && c.field === h) && result.profesor[h]).length} campos no incluidos en matching)
-                                </span>
-                              </summary>
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 mt-2 bg-slate-950/40 p-3 rounded-xl border border-white/5">
-                                {fileHeaders
-                                  .filter(
-                                    (h) =>
-                                      h !== nameColumn &&
-                                      !queryConfigs.some((c) => c.active && c.field === h) &&
-                                      result.profesor[h]
-                                  )
-                                  .map((h) => (
-                                    <div key={h} className="text-xs space-y-0.5">
-                                      <span className="text-[10px] uppercase font-bold text-slate-400">{h}:</span>
+                          {/* Otros campos del docente si existen y no fueron usados en matching */}
+                          {(() => {
+                            const excludeProfKeys = new Set([
+                              "id",
+                              "nombre_profesor",
+                              "embedding_768",
+                              "vectors",
+                              "fieldEmbeddings",
+                              nameColumn,
+                              ...queryConfigs.filter((c) => c.active).map((c) => c.field),
+                            ]);
+                            const otherKeys = Array.from(
+                              new Set([...fileHeaders, ...Object.keys(result.profesor)])
+                            ).filter((k) => !excludeProfKeys.has(k) && result.profesor[k]);
+
+                            if (otherKeys.length === 0) return null;
+
+                            return (
+                              <details className="text-xs group pt-1">
+                                <summary className="text-[11px] text-slate-400 cursor-pointer hover:text-slate-200 transition select-none flex items-center gap-1">
+                                  <span className="underline">Ver otros datos del docente</span>
+                                  <span className="text-[10px] text-slate-500">
+                                    ({otherKeys.length} campos adicionales)
+                                  </span>
+                                </summary>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 mt-2 bg-slate-950/40 p-3 rounded-xl border border-white/5">
+                                  {otherKeys.map((k) => (
+                                    <div key={k} className="text-xs space-y-0.5">
+                                      <span className="text-[10px] uppercase font-bold text-slate-400">{k}:</span>
                                       <div className="text-slate-300 whitespace-pre-wrap break-words">
-                                        {String(result.profesor[h])}
+                                        {String(result.profesor[k])}
                                       </div>
                                     </div>
                                   ))}
-                              </div>
-                            </details>
-                          )}
+                                </div>
+                              </details>
+                            );
+                          })()}
                         </div>
 
                         {/* Tarjetas de Asignaturas Recomendadas */}
@@ -3422,13 +3671,81 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                         ))}
                                   </div>
 
-                                  {/* Extracto de Contenido Temático */}
-                                  {matchItem.contenido_tematico && (
-                                    <div className="text-[11px] text-slate-300 bg-white/[0.02] p-2.5 rounded-lg border border-white/5 whitespace-pre-wrap break-words leading-relaxed max-h-60 overflow-y-auto">
-                                      <span className="font-semibold text-slate-200">Temario: </span>
-                                      {matchItem.contenido_tematico}
-                                    </div>
-                                  )}
+                                  {/* Columnas y Contenido de la Asignatura */}
+                                  <div className="space-y-1.5 pt-1">
+                                    {matchItem.contenido_tematico && (
+                                      <div className="text-[11px] text-slate-300 bg-white/[0.02] p-2.5 rounded-lg border border-white/5 whitespace-pre-wrap break-words leading-relaxed max-h-60 overflow-y-auto">
+                                        <span className="font-semibold text-slate-200">Temario: </span>
+                                        {matchItem.contenido_tematico}
+                                      </div>
+                                    )}
+
+                                    {matchItem.fines_de_aprendizaje_o_formacion && (
+                                      <div className="text-[11px] text-slate-300 bg-white/[0.02] p-2.5 rounded-lg border border-white/5 whitespace-pre-wrap break-words leading-relaxed max-h-40 overflow-y-auto">
+                                        <span className="font-semibold text-indigo-300">Fines / Objetivos de Aprendizaje: </span>
+                                        {matchItem.fines_de_aprendizaje_o_formacion}
+                                      </div>
+                                    )}
+
+                                    {matchItem.actividades_de_aprendizaje && (
+                                      <div className="text-[11px] text-slate-300 bg-white/[0.02] p-2.5 rounded-lg border border-white/5 whitespace-pre-wrap break-words leading-relaxed max-h-40 overflow-y-auto">
+                                        <span className="font-semibold text-purple-300">Actividades de Aprendizaje: </span>
+                                        {matchItem.actividades_de_aprendizaje}
+                                      </div>
+                                    )}
+
+                                    {/* Columnas adicionales / dinámicas de la asignatura */}
+                                    {(() => {
+                                      const excludeKeys = new Set([
+                                        "id",
+                                        "asignaturaId",
+                                        "clave",
+                                        "nombre",
+                                        "cluster",
+                                        "contenido_tematico",
+                                        "fines_de_aprendizaje_o_formacion",
+                                        "actividades_de_aprendizaje",
+                                        "match_nombre",
+                                        "match_semantico",
+                                        "dot_product_match",
+                                        "embedding_768",
+                                        "vectors",
+                                        "compositeSimilarity",
+                                        "fieldSimilarities",
+                                        "pairSimilarities",
+                                        "created_at",
+                                      ]);
+                                      const customEntries = Object.entries(matchItem).filter(
+                                        ([k, v]) =>
+                                          !excludeKeys.has(k) &&
+                                          !k.startsWith("vector_") &&
+                                          !k.startsWith("embedding_") &&
+                                          v !== null &&
+                                          v !== undefined &&
+                                          String(v).trim() !== ""
+                                      );
+                                      if (customEntries.length === 0) return null;
+
+                                      return (
+                                        <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[11px]">
+                                          <span className="text-[10px] uppercase font-bold text-slate-400">
+                                            Campos adicionales:
+                                          </span>
+                                          {customEntries.map(([k, v]) => (
+                                            <span
+                                              key={k}
+                                              className="inline-flex items-center gap-1 rounded bg-slate-900 border border-white/10 px-2 py-0.5 text-[10px] text-slate-300"
+                                            >
+                                              <span className="text-slate-400 capitalize">
+                                                {k.replace(/_/g, " ")}:
+                                              </span>
+                                              <strong className="text-white">{String(v)}</strong>
+                                            </span>
+                                          ))}
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
                                 </div>
                               );
                             })}

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   Upload,
   FileSpreadsheet,
@@ -19,6 +19,12 @@ import {
   ChevronDown,
   Info,
   X,
+  Plus,
+  Columns,
+  Tag,
+  ArrowRightLeft,
+  Settings,
+  CheckCheck,
 } from "lucide-react";
 import { Asignatura, ColumnMapping } from "@/types";
 import {
@@ -26,6 +32,14 @@ import {
   parseEmbeddingValue,
   apiFetch,
 } from "@/lib/utils";
+
+interface ColumnActionConfig {
+  action: "create" | "map" | "vector" | "ignore";
+  targetCol?: string;
+  newColName?: string;
+  newColType?: string;
+  createdInDb?: boolean;
+}
 
 interface TabAsignaturasProps {
   onDatabaseUpdated?: () => void;
@@ -43,7 +57,7 @@ export default function TabAsignaturas({
   const [isParsing, setIsParsing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Mapeo de columnas
+  // Mapeo de columnas estándar
   const [mapping, setMapping] = useState<ColumnMapping>({
     clave: "",
     nombre: "",
@@ -62,6 +76,14 @@ export default function TabAsignaturas({
   // Opciones de Carga
   const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("insert");
   const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
+
+  // ── Columnas de Base de Datos y Creación/Mapeo de Nuevas Columnas ──
+  const [dbColumns, setDbColumns] = useState<string[]>([]);
+  const [columnActions, setColumnActions] = useState<Record<string, ColumnActionConfig>>({});
+  const [isCreatingCol, setIsCreatingCol] = useState(false);
+  const [manualColName, setManualColName] = useState("");
+  const [manualColType, setManualColType] = useState("TEXT");
+  const [showManualColInput, setShowManualColInput] = useState(false);
 
   // Progreso de Carga
   const [isUploading, setIsUploading] = useState(false);
@@ -84,6 +106,7 @@ export default function TabAsignaturas({
       hasEmbedding: boolean;
       vectorColumns?: string[];
       created_at: string;
+      [key: string]: any;
     }>
   >([]);
   const [totalDbCount, setTotalDbCount] = useState(0);
@@ -94,7 +117,7 @@ export default function TabAsignaturas({
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"all" | "with_embedding" | "without_embedding">("all");
 
-  // ── Cargar Registros de Supabase ──
+  // ── Cargar Registros y Columnas de Supabase ──
   const loadDatabaseRecords = useCallback(async () => {
     setLoadingDb(true);
     try {
@@ -105,6 +128,7 @@ export default function TabAsignaturas({
         withEmbeddingCount: number;
         withoutEmbeddingCount: number;
         availableVectorColumns?: string[];
+        availableColumns?: string[];
         records: any[];
         error?: string;
       }>(`/api/asignaturas?q=${encodeURIComponent(searchQuery)}&filter=${filterType}&limit=50`);
@@ -117,6 +141,9 @@ export default function TabAsignaturas({
         setWithEmbeddingCount(data.withEmbeddingCount || 0);
         setWithoutEmbeddingCount(data.withoutEmbeddingCount || 0);
         setDbRecords(data.records || []);
+        if (Array.isArray(data.availableColumns) && data.availableColumns.length > 0) {
+          setDbColumns(data.availableColumns);
+        }
       }
     } catch (err) {
       console.error("Error al cargar asignaturas de Supabase:", err);
@@ -213,6 +240,199 @@ export default function TabAsignaturas({
     };
   };
 
+  // Identificar qué columnas del archivo no están asociadas a los campos estándar ni a vectores
+  const unmappedHeaders = useMemo(() => {
+    if (!fileHeaders.length) return [];
+    const mappedSources = new Set<string>();
+    if (mapping.nombre) mappedSources.add(mapping.nombre);
+    if (mapping.clave) mappedSources.add(mapping.clave);
+    if (mapping.cluster) mappedSources.add(mapping.cluster);
+    if (mapping.fines_de_aprendizaje_o_formacion) mappedSources.add(mapping.fines_de_aprendizaje_o_formacion);
+    if (mapping.contenido_tematico) mappedSources.add(mapping.contenido_tematico);
+    if (mapping.actividades_de_aprendizaje) mappedSources.add(mapping.actividades_de_aprendizaje);
+    if (mapping.embedding_768) mappedSources.add(mapping.embedding_768);
+    selectedVectorColumns.forEach((v) => mappedSources.add(v));
+
+    return fileHeaders.filter((h) => !mappedSources.has(h));
+  }, [fileHeaders, mapping, selectedVectorColumns]);
+
+  // Columnas adicionales en la base de datos que no forman parte del esquema por defecto
+  const dynamicDbFields = useMemo(() => {
+    const standardKeys = new Set([
+      "id",
+      "clave",
+      "nombre",
+      "cluster",
+      "fines_de_aprendizaje_o_formacion",
+      "contenido_tematico",
+      "actividades_de_aprendizaje",
+      "match_nombre",
+      "match_semantico",
+      "dot_product_match",
+      "embedding_768",
+      "vectors",
+      "created_at",
+    ]);
+    return dbColumns.filter((c) => !standardKeys.has(c.toLowerCase()));
+  }, [dbColumns]);
+
+  // Actualizar configuración de acción para una columna
+  const updateColumnAction = (colHeader: string, updates: Partial<ColumnActionConfig>) => {
+    setColumnActions((prev) => {
+      const current = prev[colHeader] || {
+        action: "create",
+        newColName: colHeader
+          .trim()
+          .toLowerCase()
+          .replace(/[\s-]+/g, "_")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-z0-9_]/g, "_"),
+        newColType: "TEXT",
+      };
+      return {
+        ...prev,
+        [colHeader]: { ...current, ...updates },
+      };
+    });
+  };
+
+  // Crear una columna individual en Supabase vía API
+  const handleCreateColumnInDb = async (colHeader: string) => {
+    const action = columnActions[colHeader];
+    const targetName = (action?.newColName || colHeader).trim();
+    const targetType = action?.newColType || "TEXT";
+
+    if (!targetName) {
+      alert("Por favor ingresa un nombre para la nueva columna.");
+      return;
+    }
+
+    setIsCreatingCol(true);
+    try {
+      const res = await apiFetch<{
+        success: boolean;
+        columnName?: string;
+        columnType?: string;
+        error?: string;
+      }>("/api/asignaturas/columns", {
+        method: "POST",
+        body: JSON.stringify({
+          columnName: targetName,
+          columnType: targetType,
+        }),
+      });
+
+      if (!res.success) {
+        throw new Error(res.error || "No se pudo crear la columna.");
+      }
+
+      const createdName = res.columnName || targetName;
+      setDbColumns((prev) => (prev.includes(createdName) ? prev : [...prev, createdName]));
+      updateColumnAction(colHeader, {
+        action: "create",
+        newColName: createdName,
+        createdInDb: true,
+      });
+      loadDatabaseRecords();
+    } catch (err: any) {
+      alert(`Error al crear columna '${targetName}': ${err.message}`);
+    } finally {
+      setIsCreatingCol(false);
+    }
+  };
+
+  // Crear todas las columnas pendientes marcadas como 'create'
+  const handleCreateAllNewColumns = async () => {
+    const toCreate = unmappedHeaders.filter((h) => {
+      const act = columnActions[h];
+      return (!act || act.action === "create") && !act?.createdInDb;
+    });
+
+    if (toCreate.length === 0) {
+      alert("No hay columnas pendientes de crear.");
+      return;
+    }
+
+    setIsCreatingCol(true);
+    let createdCount = 0;
+    try {
+      for (const h of toCreate) {
+        const act = columnActions[h];
+        const targetName = (act?.newColName || h).trim();
+        const targetType = act?.newColType || "TEXT";
+
+        const res = await apiFetch<{
+          success: boolean;
+          columnName?: string;
+          error?: string;
+        }>("/api/asignaturas/columns", {
+          method: "POST",
+          body: JSON.stringify({
+            columnName: targetName,
+            columnType: targetType,
+          }),
+        });
+
+        if (res.success && res.columnName) {
+          createdCount++;
+          const finalCol = res.columnName;
+          setDbColumns((prev) => (prev.includes(finalCol) ? prev : [...prev, finalCol]));
+          updateColumnAction(h, {
+            action: "create",
+            newColName: finalCol,
+            createdInDb: true,
+          });
+        }
+      }
+      loadDatabaseRecords();
+      alert(`Se crearon exitosamente ${createdCount} columna(s) en la base de datos.`);
+    } catch (err: any) {
+      alert(`Error durante la creación masiva: ${err.message}`);
+    } finally {
+      setIsCreatingCol(false);
+    }
+  };
+
+  // Crear columna manualmente en Supabase desde el formulario manual
+  const handleManualCreateCustomCol = async () => {
+    if (!manualColName.trim()) {
+      alert("Por favor ingresa el nombre de la columna.");
+      return;
+    }
+
+    setIsCreatingCol(true);
+    try {
+      const res = await apiFetch<{
+        success: boolean;
+        columnName?: string;
+        columnType?: string;
+        error?: string;
+      }>("/api/asignaturas/columns", {
+        method: "POST",
+        body: JSON.stringify({
+          columnName: manualColName.trim(),
+          columnType: manualColType,
+        }),
+      });
+
+      if (!res.success) {
+        throw new Error(res.error || "No se pudo crear la columna.");
+      }
+
+      const createdName = res.columnName || manualColName.trim();
+      setDbColumns((prev) => (prev.includes(createdName) ? prev : [...prev, createdName]));
+      setManualColName("");
+      setShowManualColInput(false);
+      loadDatabaseRecords();
+      alert(`Columna '${createdName}' (${res.columnType || manualColType}) creada exitosamente.`);
+    } catch (err: any) {
+      alert(`Error al crear columna: ${err.message}`);
+    } finally {
+      setIsCreatingCol(false);
+    }
+  };
+
   // ── Manejo de Archivo ──
   const handleFileSelected = async (selectedFile: File) => {
     setFile(selectedFile);
@@ -226,6 +446,41 @@ export default function TabAsignaturas({
       setMapping(autoMapping);
       setSelectedVectorColumns(vectorCols);
       setPrimaryVectorColumn(primaryVec);
+
+      // Identificar columnas no mapeadas y preparar acciones por defecto
+      const mappedSources = new Set<string>();
+      if (autoMapping.nombre) mappedSources.add(autoMapping.nombre);
+      if (autoMapping.clave) mappedSources.add(autoMapping.clave);
+      if (autoMapping.cluster) mappedSources.add(autoMapping.cluster);
+      if (autoMapping.fines_de_aprendizaje_o_formacion) mappedSources.add(autoMapping.fines_de_aprendizaje_o_formacion);
+      if (autoMapping.contenido_tematico) mappedSources.add(autoMapping.contenido_tematico);
+      if (autoMapping.actividades_de_aprendizaje) mappedSources.add(autoMapping.actividades_de_aprendizaje);
+      if (autoMapping.embedding_768) mappedSources.add(autoMapping.embedding_768);
+      vectorCols.forEach((v) => mappedSources.add(v));
+
+      const initialActions: Record<string, ColumnActionConfig> = {};
+      headers.forEach((h) => {
+        if (!mappedSources.has(h)) {
+          const cleanName = h
+            .trim()
+            .toLowerCase()
+            .replace(/[\s-]+/g, "_")
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^a-z0-9_]/g, "_")
+            .replace(/^_+|_+$/g, "");
+
+          const existsInDb = dbColumns.includes(cleanName);
+          initialActions[h] = {
+            action: existsInDb ? "map" : "create",
+            targetCol: existsInDb ? cleanName : "",
+            newColName: cleanName || h,
+            newColType: "TEXT",
+            createdInDb: existsInDb,
+          };
+        }
+      });
+      setColumnActions(initialActions);
     } catch (err: any) {
       alert(err.message || "Error al procesar el archivo");
       setFile(null);
@@ -255,11 +510,34 @@ export default function TabAsignaturas({
 
     setIsUploading(true);
     setUploadProgress(10);
-    setStatusMessage("Preparando todas las columnas para inserción en Supabase...");
+    setStatusMessage("Preparando columnas para inserción en Supabase...");
     setUploadReport(null);
 
     try {
-      // Filtrar filas válidas incluyendo TODAS las columnas del CSV
+      // Pre-crear columnas marcadas como 'create' que aún no estén en Supabase
+      const colsToEnsure = unmappedHeaders.filter((h) => {
+        const act = columnActions[h];
+        return (!act || act.action === "create") && !act?.createdInDb;
+      });
+
+      if (colsToEnsure.length > 0) {
+        setStatusMessage(`Asegurando existencia de ${colsToEnsure.length} columna(s) en Supabase...`);
+        for (const h of colsToEnsure) {
+          const act = columnActions[h];
+          const colName = (act?.newColName || h).trim();
+          const colType = act?.newColType || "TEXT";
+          try {
+            await apiFetch("/api/asignaturas/columns", {
+              method: "POST",
+              body: JSON.stringify({ columnName: colName, columnType: colType }),
+            });
+          } catch (e) {
+            console.warn(`No se pudo pre-crear la columna ${colName}, se intentará inserción directa:`, e);
+          }
+        }
+      }
+
+      // Filtrar filas válidas incluyendo TODAS las columnas del CSV según columnActions
       const validRows: Asignatura[] = [];
       const discardedRows: string[] = [];
       let parsedEmbeddingsCount = 0;
@@ -272,8 +550,7 @@ export default function TabAsignaturas({
           return;
         }
 
-        // Subir TODAS las columnas del CSV por defecto
-        const rowData: Record<string, any> = { ...row };
+        const rowData: Record<string, any> = {};
 
         // Asegurar que 'nombre' esté presente
         rowData.nombre = rawNombre;
@@ -298,6 +575,36 @@ export default function TabAsignaturas({
         if (mapping.actividades_de_aprendizaje && row[mapping.actividades_de_aprendizaje]) {
           rowData.actividades_de_aprendizaje = row[mapping.actividades_de_aprendizaje].trim();
         }
+
+        // Procesar columnas no estándar según columnActions
+        fileHeaders.forEach((h) => {
+          if (
+            h === mapping.nombre ||
+            h === mapping.clave ||
+            h === mapping.cluster ||
+            h === mapping.fines_de_aprendizaje_o_formacion ||
+            h === mapping.contenido_tematico ||
+            h === mapping.actividades_de_aprendizaje ||
+            selectedVectorColumns.includes(h)
+          ) {
+            return;
+          }
+
+          const actionCfg = columnActions[h];
+          const rawVal = row[h];
+          if (rawVal === undefined || rawVal === null) return;
+
+          if (!actionCfg || actionCfg.action === "create") {
+            const colKey = (actionCfg?.newColName || h).trim();
+            if (colKey) rowData[colKey] = rawVal;
+          } else if (actionCfg.action === "map") {
+            if (actionCfg.targetCol) {
+              rowData[actionCfg.targetCol] = rawVal;
+            }
+          } else if (actionCfg.action === "ignore") {
+            // Omitir columna explícitamente
+          }
+        });
 
         // Parsear embeddings de todas las columnas vectoriales seleccionadas (Multi-Vector)
         const rowVectors: Record<string, number[]> = {};
@@ -509,7 +816,7 @@ export default function TabAsignaturas({
       key: "clave",
       label: "Clave / Código",
       required: false,
-      description: "Identificador único de la asignatura (utilizado como clave de conflicto en Upsert)",
+      description: "Clave o código de la asignatura (permite claves duplicadas o múltiples grupos/planes)",
     },
     {
       key: "cluster",
@@ -792,53 +1099,350 @@ export default function TabAsignaturas({
               )}
             </div>
 
-            {/* 2. TODAS LAS COLUMNAS A SUBIR POR DEFECTO */}
-            <div className="rounded-xl border border-white/10 bg-slate-950/60 p-5 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                    Se subirán automáticamente TODAS las columnas del archivo ({fileHeaders.length}):
-                  </h3>
+            {/* 2. GESTIÓN Y MAPEO DE NUEVAS COLUMNAS DETECTADAS */}
+            <div className="rounded-xl border border-indigo-500/30 bg-slate-950/70 p-5 space-y-5 shadow-lg shadow-indigo-950/20">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <div className="rounded-lg bg-indigo-500/20 p-2 text-indigo-300 border border-indigo-500/30">
+                    <Columns className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      Columnas Detectadas y Mapeo Dinámico
+                      {unmappedHeaders.length > 0 ? (
+                        <span className="text-[10px] rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 font-bold">
+                          {unmappedHeaders.length} nueva{unmappedHeaders.length === 1 ? "" : "s"} columna{unmappedHeaders.length === 1 ? "" : "s"}
+                        </span>
+                      ) : (
+                        <span className="text-[10px] rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-2 py-0.5 font-bold">
+                          Todas mapeadas
+                        </span>
+                      )}
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Gestiona qué columnas se suben a Supabase, crea nuevas columnas en la tabla o mapea a campos existentes.
+                    </p>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowAdvancedMapping((prev) => !prev)}
-                  className="text-xs text-indigo-400 hover:text-indigo-300 underline font-medium"
-                >
-                  {showAdvancedMapping ? "Ocultar mapeo manual" : "Mapeo manual avanzado (opcional)"}
-                </button>
-              </div>
 
-              <div className="flex flex-wrap gap-1.5">
-                {fileHeaders.map((header) => {
-                  const isSelectedVector = selectedVectorColumns.includes(header);
-                  const isPrimary = header === primaryVectorColumn;
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowManualColInput((prev) => !prev)}
+                    className="flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1.5 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 transition"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    <span>+ Nueva Columna en BD</span>
+                  </button>
 
-                  return (
-                    <span
-                      key={header}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-mono border ${
-                        isPrimary
-                          ? "border-amber-400/60 bg-amber-500/20 text-amber-200 font-bold"
-                          : isSelectedVector
-                          ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-semibold"
-                          : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 font-medium"
-                      }`}
+                  {unmappedHeaders.some((h) => (!columnActions[h] || columnActions[h]?.action === "create") && !columnActions[h]?.createdInDb && !dbColumns.includes(columnActions[h]?.newColName || h)) && (
+                    <button
+                      type="button"
+                      disabled={isCreatingCol}
+                      onClick={handleCreateAllNewColumns}
+                      className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-50 transition shadow-sm"
                     >
-                      {header}
-                      {isPrimary ? " (Vector Principal 768d)" : isSelectedVector ? " (Vector 768d)" : ""}
-                    </span>
-                  );
-                })}
+                      <CheckCheck className="h-3.5 w-3.5" />
+                      <span>{isCreatingCol ? "Creando en BD..." : "Crear Nuevas en BD"}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvancedMapping((prev) => !prev)}
+                    className="text-xs text-slate-400 hover:text-white underline font-medium ml-1"
+                  >
+                    {showAdvancedMapping ? "Ocultar mapeo estándar" : "Mapeo estándar manual"}
+                  </button>
+                </div>
               </div>
 
-              {/* Mapeo manual opcional */}
+              {/* Formulario desplegable para creación manual de columna */}
+              {showManualColInput && (
+                <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 space-y-3 animate-in fade-in">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white flex items-center gap-2">
+                      <Tag className="h-3.5 w-3.5 text-indigo-400" />
+                      Crear columna personalizada en la tabla public.asignaturas
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowManualColInput(false)}
+                      className="text-slate-400 hover:text-white"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex-1 min-w-[180px]">
+                      <input
+                        type="text"
+                        placeholder="Nombre de la columna (ej. creditos, semestre, plan_estudios)"
+                        value={manualColName}
+                        onChange={(e) => setManualColName(e.target.value)}
+                        className="w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="w-36">
+                      <select
+                        value={manualColType}
+                        onChange={(e) => setManualColType(e.target.value)}
+                        className="w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                      >
+                        <option value="TEXT">TEXT (Texto)</option>
+                        <option value="REAL">REAL (Numérico decimal)</option>
+                        <option value="INTEGER">INTEGER (Entero)</option>
+                        <option value="BOOLEAN">BOOLEAN (Booleano)</option>
+                        <option value="JSONB">JSONB (Objeto/Array)</option>
+                      </select>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isCreatingCol || !manualColName.trim()}
+                      onClick={handleManualCreateCustomCol}
+                      className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-500 disabled:opacity-50 transition"
+                    >
+                      {isCreatingCol ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                      <span>Crear en Supabase</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Resumen visual de todas las columnas del archivo */}
+              <div className="space-y-2">
+                <span className="text-[11px] font-semibold text-slate-300">
+                  Todas las columnas del archivo ({fileHeaders.length}):
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {fileHeaders.map((header) => {
+                    const isPrimary = header === primaryVectorColumn;
+                    const isSelectedVector = selectedVectorColumns.includes(header);
+                    const isStandard =
+                      header === mapping.nombre ||
+                      header === mapping.clave ||
+                      header === mapping.cluster ||
+                      header === mapping.fines_de_aprendizaje_o_formacion ||
+                      header === mapping.contenido_tematico ||
+                      header === mapping.actividades_de_aprendizaje;
+                    const actionCfg = columnActions[header];
+                    const isIgnored = actionCfg?.action === "ignore";
+                    const isMappedCustom = actionCfg?.action === "map";
+
+                    return (
+                      <span
+                        key={header}
+                        className={`rounded-lg px-2.5 py-1 text-xs font-mono border flex items-center gap-1.5 ${
+                          isPrimary
+                            ? "border-amber-400/60 bg-amber-500/20 text-amber-200 font-bold"
+                            : isSelectedVector
+                            ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-semibold"
+                            : isIgnored
+                            ? "border-slate-700/50 bg-slate-800/40 text-slate-500 line-through"
+                            : isMappedCustom
+                            ? "border-sky-500/40 bg-sky-500/15 text-sky-200 font-medium"
+                            : isStandard
+                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 font-medium"
+                            : "border-amber-500/40 bg-amber-500/15 text-amber-200 font-medium"
+                        }`}
+                      >
+                        <span>{header}</span>
+                        {isPrimary ? (
+                          <span className="text-[10px] text-amber-300 font-sans font-bold">★ Principal</span>
+                        ) : isSelectedVector ? (
+                          <span className="text-[10px] text-purple-300 font-sans">Vector</span>
+                        ) : isIgnored ? (
+                          <span className="text-[10px] text-slate-500 font-sans">Omitida</span>
+                        ) : isMappedCustom ? (
+                          <span className="text-[10px] text-sky-300 font-sans">→ {actionCfg.targetCol}</span>
+                        ) : isStandard ? (
+                          <span className="text-[10px] text-emerald-300 font-sans">Estándar</span>
+                        ) : (
+                          <span className="text-[10px] text-amber-300 font-sans">Nueva Columna</span>
+                        )}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Lista interactiva de columnas no mapeadas */}
+              {unmappedHeaders.length > 0 && (
+                <div className="pt-3 border-t border-white/10 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-200 flex items-center gap-2">
+                      <ArrowRightLeft className="h-3.5 w-3.5 text-amber-400" />
+                      Configuración para columnas adicionales ({unmappedHeaders.length}):
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Define si se crea una nueva columna en BD, se mapea o se ignora
+                    </span>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    {unmappedHeaders.map((header) => {
+                      const action = columnActions[header] || {
+                        action: "create",
+                        newColName: header.trim().toLowerCase().replace(/[\s-]+/g, "_").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9_]/g, "_"),
+                        newColType: "TEXT",
+                      };
+                      const sampleVal = fileRows[0]?.[header];
+                      const cleanName = action.newColName || header.trim().toLowerCase().replace(/[\s-]+/g, "_").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9_]/g, "_");
+                      const alreadyInDb = action.createdInDb || dbColumns.includes(cleanName.toLowerCase());
+
+                      return (
+                        <div
+                          key={header}
+                          className={`rounded-xl border p-3.5 transition ${
+                            action.action === "ignore"
+                              ? "border-white/5 bg-slate-900/40 opacity-60"
+                              : alreadyInDb
+                              ? "border-emerald-500/30 bg-emerald-950/20"
+                              : "border-white/10 bg-slate-900/80"
+                          }`}
+                        >
+                          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                            {/* Nombre original en CSV y Muestra */}
+                            <div className="space-y-1 min-w-[220px]">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-xs font-bold text-white bg-slate-950 px-2 py-0.5 rounded border border-white/10">
+                                  {header}
+                                </span>
+                                {alreadyInDb && action.action === "create" && (
+                                  <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 flex items-center gap-1">
+                                    <Check className="h-3 w-3" /> Columna existe en BD
+                                  </span>
+                                )}
+                              </div>
+                              {sampleVal && (
+                                <p className="text-[11px] text-slate-400 font-mono truncate max-w-sm">
+                                  Muestra: <span className="text-slate-200 font-sans">&quot;{sampleVal}&quot;</span>
+                                </p>
+                              )}
+                            </div>
+
+                            {/* Controles de Acción */}
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              {/* Selector de Acción */}
+                              <div className="w-52">
+                                <select
+                                  value={action.action}
+                                  onChange={(e) => {
+                                    const newAction = e.target.value as ColumnActionConfig["action"];
+                                    if (newAction === "vector") {
+                                      toggleVectorColumn(header);
+                                    } else {
+                                      updateColumnAction(header, { action: newAction });
+                                    }
+                                  }}
+                                  className="w-full rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                                >
+                                  <option value="create">Crear nueva columna en BD</option>
+                                  <option value="map">Mapear a columna existente</option>
+                                  <option value="vector">Marcar como vector (768d)</option>
+                                  <option value="ignore">Ignorar / No importar</option>
+                                </select>
+                              </div>
+
+                              {/* Opciones según la acción */}
+                              {action.action === "create" && (
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <input
+                                    type="text"
+                                    placeholder="Nombre columna en BD"
+                                    value={action.newColName ?? cleanName}
+                                    onChange={(e) =>
+                                      updateColumnAction(header, { newColName: e.target.value })
+                                    }
+                                    className="w-40 rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-white font-mono focus:border-indigo-500 focus:outline-none"
+                                  />
+                                  <select
+                                    value={action.newColType || "TEXT"}
+                                    onChange={(e) =>
+                                      updateColumnAction(header, { newColType: e.target.value })
+                                    }
+                                    className="w-24 rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                                  >
+                                    <option value="TEXT">TEXT</option>
+                                    <option value="REAL">REAL</option>
+                                    <option value="INTEGER">INTEGER</option>
+                                    <option value="BOOLEAN">BOOLEAN</option>
+                                    <option value="JSONB">JSONB</option>
+                                  </select>
+
+                                  {!alreadyInDb ? (
+                                    <button
+                                      type="button"
+                                      disabled={isCreatingCol}
+                                      onClick={() => handleCreateColumnInDb(header)}
+                                      className="rounded-lg bg-indigo-600/80 hover:bg-indigo-600 px-2.5 py-1.5 text-xs font-semibold text-white transition disabled:opacity-50 flex items-center gap-1"
+                                      title="Crear esta columna en Supabase ahora"
+                                    >
+                                      <Plus className="h-3 w-3" />
+                                      <span>Crear en BD</span>
+                                    </button>
+                                  ) : (
+                                    <span className="text-[11px] text-emerald-400 font-semibold px-2">
+                                      Lista para inserción
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+
+                              {action.action === "map" && (
+                                <div className="w-52">
+                                  <select
+                                    value={action.targetCol || ""}
+                                    onChange={(e) =>
+                                      updateColumnAction(header, { targetCol: e.target.value })
+                                    }
+                                    className="w-full rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                                  >
+                                    <option value="">-- Seleccionar columna destino --</option>
+                                    <optgroup label="Campos estándar">
+                                      <option value="clave">clave</option>
+                                      <option value="nombre">nombre</option>
+                                      <option value="cluster">cluster</option>
+                                      <option value="contenido_tematico">contenido_tematico</option>
+                                      <option value="fines_de_aprendizaje_o_formacion">fines_de_aprendizaje_o_formacion</option>
+                                      <option value="actividades_de_aprendizaje">actividades_de_aprendizaje</option>
+                                    </optgroup>
+                                    {dynamicDbFields.length > 0 && (
+                                      <optgroup label="Columnas personalizadas en BD">
+                                        {dynamicDbFields.map((c) => (
+                                          <option key={c} value={c}>
+                                            {c}
+                                          </option>
+                                        ))}
+                                      </optgroup>
+                                    )}
+                                  </select>
+                                </div>
+                              )}
+
+                              {action.action === "ignore" && (
+                                <span className="text-xs text-slate-500 italic">
+                                  Esta columna no se enviará a la base de datos
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Mapeo manual avanzado opcional de campos estándar */}
               {showAdvancedMapping && (
                 <div className="pt-4 border-t border-white/10 space-y-3 animate-in fade-in">
-                  <p className="text-[11px] text-slate-400">
-                    Por defecto las columnas se asocian automáticamente con la tabla. Solo utiliza estos selectores si los nombres en tu archivo difieren significativamente.
-                  </p>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <Settings className="h-3.5 w-3.5 text-indigo-400" />
+                      Mapeo explícito a campos principales de asignaturas:
+                    </span>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                     {targetFields.map((field) => (
                       <div key={field.key} className="rounded-lg border border-white/10 bg-slate-900/90 p-3 space-y-1.5">
@@ -949,8 +1553,8 @@ export default function TabAsignaturas({
                   onChange={(e) => setUpsertMode(e.target.value as "upsert" | "insert")}
                   className="rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white"
                 >
-                  <option value="insert">Modo: Insert (Siempre nuevo registro - Recomendado)</option>
-                  <option value="upsert">Modo: Upsert (Actualizar por clave única)</option>
+                  <option value="insert">Modo: Insert (Siempre nuevo registro - Permite claves repetidas)</option>
+                  <option value="upsert">Modo: Upsert (Actualizar solo si el registro incluye ID)</option>
                 </select>
 
                 <button
@@ -1032,7 +1636,22 @@ export default function TabAsignaturas({
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
+            {dbColumns.length > 0 && (
+              <span className="rounded-lg bg-indigo-500/10 border border-indigo-500/25 px-2.5 py-1 text-xs font-mono text-indigo-300">
+                {dbColumns.length} columnas en BD
+              </span>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowManualColInput((prev) => !prev)}
+              className="flex items-center gap-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-1.5 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 transition"
+              title="Añadir una columna personalizada a la tabla asignaturas"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>+ Nueva Columna</span>
+            </button>
 
             <button
               type="button"
@@ -1055,6 +1674,58 @@ export default function TabAsignaturas({
             )}
           </div>
         </div>
+
+        {/* Formulario desplegable para creación manual de columna desde Sección 2 si no hay archivo abierto */}
+        {showManualColInput && !file && (
+          <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 space-y-3 animate-in fade-in">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-white flex items-center gap-2">
+                <Tag className="h-3.5 w-3.5 text-indigo-400" />
+                Crear columna personalizada en la tabla public.asignaturas
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowManualColInput(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex-1 min-w-[180px]">
+                <input
+                  type="text"
+                  placeholder="Nombre de la columna (ej. creditos, semestre, plan_estudios)"
+                  value={manualColName}
+                  onChange={(e) => setManualColName(e.target.value)}
+                  className="w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+              <div className="w-36">
+                <select
+                  value={manualColType}
+                  onChange={(e) => setManualColType(e.target.value)}
+                  className="w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs text-white focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="TEXT">TEXT (Texto)</option>
+                  <option value="REAL">REAL (Numérico decimal)</option>
+                  <option value="INTEGER">INTEGER (Entero)</option>
+                  <option value="BOOLEAN">BOOLEAN (Booleano)</option>
+                  <option value="JSONB">JSONB (Objeto/Array)</option>
+                </select>
+              </div>
+              <button
+                type="button"
+                disabled={isCreatingCol || !manualColName.trim()}
+                onClick={handleManualCreateCustomCol}
+                className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-500 disabled:opacity-50 transition"
+              >
+                {isCreatingCol ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                <span>Crear en Supabase</span>
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Tarjetas de Métricas de Base de Datos */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
