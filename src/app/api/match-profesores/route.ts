@@ -283,15 +283,42 @@ export async function POST(req: NextRequest) {
 
     let targetRows: any[] = [];
     try {
-      let queryBuilder = supabase.from("asignaturas").select("*");
       if (hasFilter) {
-        queryBuilder = queryBuilder.in("id", filterAsignaturaIds);
+        // Consultar por lotes seguros de IDs para evitar desbordamiento de URL en PostgREST y statement timeout
+        const CHUNK_SIZE = 250;
+        for (let i = 0; i < filterAsignaturaIds.length; i += CHUNK_SIZE) {
+          const slice = filterAsignaturaIds.slice(i, i + CHUNK_SIZE);
+          const { data, error } = await supabase
+            .from("asignaturas")
+            .select("*")
+            .in("id", slice);
+
+          if (error) throw error;
+          if (Array.isArray(data)) targetRows.push(...data);
+        }
+      } else {
+        // Catálogo completo: paginar en bloques de 500 para evitar límite de 1,000 filas de PostgREST y timeouts
+        const { count: totalAsigs, error: countErr } = await supabase
+          .from("asignaturas")
+          .select("id", { count: "exact", head: true });
+
+        if (countErr) throw countErr;
+        const total = totalAsigs || 0;
+        const PAGE_SIZE = 500;
+        const numPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+        for (let i = 0; i < numPages; i++) {
+          const from = i * PAGE_SIZE;
+          const to = from + PAGE_SIZE - 1;
+          const { data, error } = await supabase
+            .from("asignaturas")
+            .select("*")
+            .range(from, to);
+
+          if (error) throw error;
+          if (Array.isArray(data)) targetRows.push(...data);
+        }
       }
-      const { data, error } = await queryBuilder;
-      if (error) {
-        throw error;
-      }
-      targetRows = data || [];
     } catch (fetchErr: any) {
       throw new Error(`Error al consultar asignaturas en Supabase: ${fetchErr.message}`);
     }

@@ -36,10 +36,10 @@ export async function POST(req: NextRequest) {
     const inputSet = new Set(uniqueInputClaves);
     const supabase = createDirectServerClient();
 
-    // Obtener conteo total para paginación segura
+    // 1. Obtener conteo total para paginación segura
     const { count: totalCount, error: countErr } = await supabase
       .from("asignaturas")
-      .select("*", { count: "exact", head: true });
+      .select("id", { count: "exact", head: true });
 
     if (countErr) {
       throw new Error(`Error al consultar catálogo de asignaturas: ${countErr.message}`);
@@ -48,75 +48,77 @@ export async function POST(req: NextRequest) {
     const total = totalCount || 0;
     const PAGE_SIZE = 1000;
     const numPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const allRows: any[] = [];
 
-    // Descargar metadatos básicos en paralelo con soporte multi-vector
-    let selectFields = "id, clave, nombre, cluster, contenido_tematico, match_nombre, embedding_768, vectors";
-    let allRows: any[] = [];
-
-    const fetchPages = async (fields: string) => {
-      const pagePromises = [];
-      for (let i = 0; i < numPages; i++) {
-        const from = i * PAGE_SIZE;
-        const to = from + PAGE_SIZE - 1;
-        pagePromises.push(
-          supabase
-            .from("asignaturas")
-            .select(fields)
-            .range(from, to)
-        );
-      }
-      const pageResults = await Promise.all(pagePromises);
-      const rows: any[] = [];
-      for (const res of pageResults) {
-        if (res.error) throw res.error;
-        if (Array.isArray(res.data)) rows.push(...res.data);
-      }
-      return rows;
-    };
-
-    try {
-      allRows = await fetchPages(selectFields);
-    } catch (pageErr: any) {
-      if (pageErr.message?.includes("vectors") || pageErr.code === "42703") {
-        selectFields = "id, clave, nombre, cluster, contenido_tematico, match_nombre, embedding_768";
-        allRows = await fetchPages(selectFields);
-      } else {
-        throw pageErr;
-      }
+    // 2. Descargar ÚNICAMENTE metadatos ultraligeros de asignaturas (sin vectores de 768d ni textos masivos)
+    // Se ejecuta en paralelo para máxima velocidad y previene de raíz el error 'canceling statement due to statement timeout'
+    const pagePromises = [];
+    for (let i = 0; i < numPages; i++) {
+      const from = i * PAGE_SIZE;
+      const to = from + PAGE_SIZE - 1;
+      pagePromises.push(
+        supabase
+          .from("asignaturas")
+          .select("id, clave, nombre, cluster, match_nombre")
+          .range(from, to)
+      );
+    }
+    const pageResults = await Promise.all(pagePromises);
+    for (const res of pageResults) {
+      if (res.error) throw res.error;
+      if (Array.isArray(res.data)) allRows.push(...res.data);
     }
 
-    // Filtrar asignaturas cuya clave limpia coincida con las claves subidas
-    const matchedAsignaturas: FilteredAsignatura[] = [];
-    const matchedIds: number[] = [];
+    // 3. Filtrar asignaturas cuya clave limpia coincida con las claves subidas
+    const matchedRows: any[] = [];
     const matchedCleanClaves = new Set<string>();
 
     for (const row of allRows) {
       const cClean = cleanClave(row.clave);
       if (cClean && inputSet.has(cClean)) {
-        const vCols: string[] = [];
-        if (row.embedding_768) vCols.push("embedding_768");
-        if (row.vectors && typeof row.vectors === "object") {
-          Object.keys(row.vectors).forEach((vk) => {
-            if (!vCols.includes(vk)) vCols.push(vk);
-          });
-        }
-
-        matchedAsignaturas.push({
-          id: row.id,
-          clave: row.clave,
-          cleanClave: cClean,
-          nombre: row.nombre,
-          cluster: row.cluster || null,
-          contenido_tematico: row.contenido_tematico || "",
-          match_nombre: Boolean(row.match_nombre),
-          hasEmbedding: vCols.length > 0 || Boolean(row.embedding_768),
-          vectors: row.vectors || null,
-          vectorColumns: vCols,
-        });
-        matchedIds.push(row.id);
+        matchedRows.push({ ...row, cleanClave: cClean });
         matchedCleanClaves.add(cClean);
       }
     }
+
+    const matchedIds = matchedRows.map((r) => r.id);
+
+    // 4. Descubrir columnas vectoriales disponibles muestreando un número mínimo de registros
+    // Se evita por completo consultar 'embedding_768' o 'vectors' sobre las cientos de filas filtradas,
+    // ya que deserializar miles de floats de 768 dimensiones satura la red y provoca el statement_timeout.
+    // El frontend solo requiere conocer los nombres de las columnas vectoriales para los selectores de peso.
+    const discoveredVectorCols = new Set<string>(["embedding_768"]);
+    try {
+      const { data: sampleVectors } = await supabase
+        .from("asignaturas")
+        .select("vectors")
+        .not("vectors", "is", null)
+        .limit(5);
+
+      (sampleVectors || []).forEach((row: any) => {
+        if (row.vectors && typeof row.vectors === "object") {
+          Object.keys(row.vectors).forEach((k) => discoveredVectorCols.add(k));
+        }
+      });
+    } catch {
+      // Fallback seguro con vector principal
+    }
+
+    const availableColsArray = Array.from(discoveredVectorCols);
+
+    // 5. Construir asignaturas filtradas ultraligeras (sin transferir megabytes de floats)
+    const matchedAsignaturas: FilteredAsignatura[] = matchedRows.map((row) => ({
+      id: row.id,
+      clave: row.clave,
+      cleanClave: row.cleanClave,
+      nombre: row.nombre,
+      cluster: row.cluster || null,
+      contenido_tematico: "",
+      match_nombre: Boolean(row.match_nombre),
+      hasEmbedding: true,
+      vectors: null,
+      vectorColumns: availableColsArray,
+    }));
 
     // Identificar claves que no se encontraron en la base de datos
     const unmatchedClaves = uniqueInputClaves.filter((k) => !matchedCleanClaves.has(k));
