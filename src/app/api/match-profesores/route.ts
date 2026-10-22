@@ -5,7 +5,7 @@ import {
   computeCompositeEmbedding,
 } from "@/lib/gemini/embeddings";
 import { geminiRateLimiter } from "@/lib/gemini/rate-limiter";
-import { Profesor, QueryConfig, MatchResultItem, ProfesorMatchResult, RegexFilterConfig } from "@/types";
+import { Profesor, QueryConfig, MatchResultItem, ProfesorMatchResult, RegexFilterConfig, DistancePairConfig } from "@/types";
 import {
   sanitizarCvParaModelo,
   evaluateProfessorCredentialAcrossFields,
@@ -14,6 +14,7 @@ import {
 export const maxDuration = 120; // 2 minutos para procesamiento de matching en lotes
 
 function computeCosineSimilarity(vecA: number[], vecB: number[]): number {
+  if (!vecA || !vecB || vecA.length !== 768 || vecB.length !== 768) return 0;
   let dot = 0;
   let normA = 0;
   let normB = 0;
@@ -34,6 +35,7 @@ export async function POST(req: NextRequest) {
     const apiKey = headerKey || body.apiKey;
     const profesores: Profesor[] = body.profesores || [];
     const queryConfigs: QueryConfig[] = body.queryConfigs || [];
+    const rawDistancePairs: DistancePairConfig[] = body.distancePairs || [];
     const filterMode: "threshold" | "topK" | "both" = body.filterMode || "both";
     const threshold: number = typeof body.threshold === "number" ? body.threshold : 0.65;
     const topK: number = typeof body.topK === "number" ? Math.max(1, body.topK) : 3;
@@ -62,129 +64,83 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── CONFIGURACIÓN DE PARES DE DISTANCIA (MULTI-VECTOR) ──
+    // Si no se proporcionaron distancePairs explícitos, construir pares 1 a 1 por defecto (compatibilidad)
+    let distancePairs: DistancePairConfig[] = [];
+    if (Array.isArray(rawDistancePairs) && rawDistancePairs.length > 0) {
+      distancePairs = rawDistancePairs;
+    } else {
+      distancePairs = activeConfigs.map((c) => ({
+        id: c.field,
+        profField: c.field,
+        asigVectorCol: "embedding_768",
+        label: `${c.label || c.field} ↔ Vector Principal`,
+        active: true,
+        weight: c.weight,
+      }));
+    }
+
+    const activePairs = distancePairs.filter((p) => p.active !== false);
+    if (!activePairs.length) {
+      return NextResponse.json(
+        { success: false, error: "Debes tener al menos un par de distancia activo entre profesor y asignatura." },
+        { status: 400 }
+      );
+    }
+
+    // Campos de profesor requeridos por los pares activos
+    const requiredProfFields = Array.from(new Set(activePairs.map((p) => p.profField)));
+
     // Configuración opcional de cluster y betas
     const clusterColumn: string = (body.clusterColumn || "cluster").trim();
     const rawClusterBetas: Record<string, Record<string, number>> = body.clusterBetas || {};
     const rawDefaultBetas: Record<string, number> = body.defaultBetas || {};
 
-    // Normalizar pesos base sum(w_i) = 1.0
-    const totalRawWeight = activeConfigs.reduce((acc, c) => acc + (c.weight > 0 ? c.weight : 0), 0);
-    const normalizedConfigs = activeConfigs.map((c) => ({
-      ...c,
-      normalizedWeight: totalRawWeight > 0 ? (c.weight > 0 ? c.weight / totalRawWeight : 0) : 1 / activeConfigs.length,
-    }));
-
-    const weightMap: Record<string, number> = {};
-    normalizedConfigs.forEach((c) => {
-      weightMap[c.field] = c.normalizedWeight;
+    // Normalizar pesos base de los pares sum(w_pair) = 1.0
+    const totalRawPairWeight = activePairs.reduce((acc, p) => acc + (p.weight > 0 ? p.weight : 0), 0);
+    const pairWeightMap: Record<string, number> = {};
+    activePairs.forEach((p) => {
+      pairWeightMap[p.id] = totalRawPairWeight > 0 ? (p.weight > 0 ? p.weight / totalRawPairWeight : 0) : 1 / activePairs.length;
     });
 
-    const activeFields = normalizedConfigs.map((c) => c.field);
+    const activePairIds = activePairs.map((p) => p.id);
 
-    // Función auxiliar para normalizar los betas de un cluster
-    const normalizeWeights = (rawWeights: Record<string, number>): Record<string, number> => {
+    // Función auxiliar para normalizar los betas de un cluster para los pares de distancia
+    const normalizePairWeights = (rawWeights: Record<string, number>): Record<string, number> => {
       let total = 0;
-      activeFields.forEach((f) => {
-        const w = typeof rawWeights[f] === "number" && rawWeights[f] > 0 ? rawWeights[f] : 0;
+      activePairIds.forEach((pid) => {
+        const pair = activePairs.find((p) => p.id === pid);
+        // Soporte tanto de key como pair.id como pair.profField (compatibilidad hacia atrás)
+        const rawVal = rawWeights[pid] !== undefined ? rawWeights[pid] : (pair ? rawWeights[pair.profField] : undefined);
+        const w = typeof rawVal === "number" && rawVal > 0 ? rawVal : 0;
         total += w;
       });
       const res: Record<string, number> = {};
-      activeFields.forEach((f) => {
-        const w = typeof rawWeights[f] === "number" && rawWeights[f] > 0 ? rawWeights[f] : 0;
-        res[f] = total > 0 ? w / total : 1 / activeFields.length;
+      activePairIds.forEach((pid) => {
+        const pair = activePairs.find((p) => p.id === pid);
+        const rawVal = rawWeights[pid] !== undefined ? rawWeights[pid] : (pair ? rawWeights[pair.profField] : undefined);
+        const w = typeof rawVal === "number" && rawVal > 0 ? rawVal : 0;
+        res[pid] = total > 0 ? w / total : 1 / activePairIds.length;
       });
       return res;
     };
 
-    // Betas predeterminadas (fallback para asignaturas sin cluster o clusters no configurados)
+    // Betas predeterminadas de los pares
     const normalizedDefaultBetas = Object.keys(rawDefaultBetas).length > 0
-      ? normalizeWeights(rawDefaultBetas)
-      : weightMap;
+      ? normalizePairWeights(rawDefaultBetas)
+      : pairWeightMap;
 
-    // Matriz de betas normalizadas por cluster
+    // Matriz de betas normalizadas por cluster para cada par
     const normalizedClusterBetas: Record<string, Record<string, number>> = {};
     for (const [cName, betasObj] of Object.entries(rawClusterBetas)) {
       if (betasObj && typeof betasObj === "object") {
-        normalizedClusterBetas[cName] = normalizeWeights(betasObj);
+        normalizedClusterBetas[cName] = normalizePairWeights(betasObj);
       }
     }
 
     const supabase = createDirectServerClient();
 
-    // Si hay filtro activo, cargar previamente las asignaturas objetivo y sus embeddings
-    let targetAsignaturas: {
-      id: number;
-      clave: string;
-      nombre: string;
-      cluster: string | null;
-      contenido_tematico: string;
-      match_nombre: boolean;
-      embedding: number[];
-    }[] | null = null;
-
-    if (hasFilter) {
-      const selectColumns = `id, clave, nombre, contenido_tematico, match_nombre, embedding_768, cluster${
-        clusterColumn && clusterColumn !== "cluster" ? `, ${clusterColumn}` : ""
-      }`;
-
-      const { data: filterRows, error: fetchFilterErr } = await supabase
-        .from("asignaturas")
-        .select(selectColumns)
-        .in("id", filterAsignaturaIds)
-        .not("embedding_768", "is", null);
-
-      if (fetchFilterErr) {
-        throw new Error(`Error al consultar asignaturas filtradas: ${fetchFilterErr.message}`);
-      }
-
-      if (!filterRows || filterRows.length === 0) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Ninguna de las asignaturas filtradas tiene embeddings disponibles en la base de datos.",
-          },
-          { status: 400 }
-        );
-      }
-
-      targetAsignaturas = filterRows
-        .map((r: any) => {
-          let emb = r.embedding_768;
-          if (typeof emb === "string") {
-            try {
-              emb = JSON.parse(emb);
-            } catch {
-              emb = null;
-            }
-          }
-          const rawClusterVal = r[clusterColumn] !== undefined ? r[clusterColumn] : r.cluster;
-          const cleanCluster = rawClusterVal != null && String(rawClusterVal).trim() !== "" ? String(rawClusterVal).trim() : null;
-
-          return {
-            id: r.id,
-            clave: r.clave || "",
-            nombre: r.nombre || "",
-            cluster: cleanCluster,
-            contenido_tematico: r.contenido_tematico || "",
-            match_nombre: Boolean(r.match_nombre),
-            embedding: emb,
-          };
-        })
-        .filter((r) => Array.isArray(r.embedding) && r.embedding.length === 768);
-
-      if (targetAsignaturas.length === 0) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Los vectores de las asignaturas filtradas no son válidos (requieren dimensión 768).",
-          },
-          { status: 400 }
-        );
-      }
-    }
-
     // ── GESTIÓN DE EMBEDDINGS DE PROFESORES: PRECOMPUTADOS vs GEMINI 2 ──
-    // Inicializar mapas con cualquier embedding ya provisto en el profesor
     const profFieldEmbeddings: Record<string, number[]>[] = profesores.map((prof) => {
       const existing: Record<string, number[]> = {};
       if (prof.fieldEmbeddings && typeof prof.fieldEmbeddings === "object") {
@@ -217,7 +173,7 @@ export async function POST(req: NextRequest) {
       return regexFilter?.enabled ? "intact" : "bypassed";
     });
 
-    // Solo crear tareas de generación para aquellos campos que NO tengan vector precalculado
+    // Crear tareas de generación para campos requeridos por los pares activos sin vector precalculado
     profesores.forEach((prof, profIndex) => {
       let contextHasCredential: boolean | undefined = undefined;
       let profWasSanitized = false;
@@ -232,11 +188,10 @@ export async function POST(req: NextRequest) {
           contextHasCredential = evaluateProfessorCredentialAcrossFields(
             prof,
             regexFilter.regexCredencial,
-            activeFields
+            requiredProfFields
           );
         }
 
-        // Si el docente no cuenta con credencial pedagógica oficial, sanitizar sus campos de texto
         if (!contextHasCredential) {
           Object.keys(prof).forEach((key) => {
             if (
@@ -259,46 +214,45 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        profSanitizationStatuses[profIndex] = profWasSanitized
-          ? "sanitized"
-          : "intact";
+        profSanitizationStatuses[profIndex] = profWasSanitized ? "sanitized" : "intact";
       }
 
-      for (const config of normalizedConfigs) {
-        if (profFieldEmbeddings[profIndex][config.field]) {
+      for (const reqField of requiredProfFields) {
+        if (profFieldEmbeddings[profIndex][reqField]) {
           continue; // Ya tiene embedding precalculado
         }
 
-        const rawVal = prof[config.field];
+        const config = activeConfigs.find((c) => c.field === reqField) || {
+          field: reqField,
+          template: `${reqField}: {value}`,
+        };
+
+        const rawVal = prof[reqField];
         let valText = typeof rawVal === "string" ? rawVal.trim() : rawVal != null ? String(rawVal).trim() : "";
         if (!valText) continue;
 
-        // Asegurar que si el filtro está activado y el profesor no tiene credencial, el texto esté sanitizado
         if (regexFilter?.enabled && !contextHasCredential) {
           const sanitizedResult = sanitizarCvParaModelo(valText, regexFilter, false);
           valText = sanitizedResult.sanitizedText;
           if (sanitizedResult.status === "sanitized") {
             profWasSanitized = true;
           }
-          prof[config.field] = sanitizedResult.sanitizedText;
+          prof[reqField] = sanitizedResult.sanitizedText;
         }
 
         const queryText = config.template.includes("{value}")
           ? config.template.replace(/\{value\}/g, valText)
           : `${config.template}: ${valText}`;
 
-        tasks.push({ profIndex, field: config.field, queryText });
+        tasks.push({ profIndex, field: reqField, queryText });
       }
 
       if (regexFilter?.enabled) {
-        profSanitizationStatuses[profIndex] = profWasSanitized
-          ? "sanitized"
-          : "intact";
+        profSanitizationStatuses[profIndex] = profWasSanitized ? "sanitized" : "intact";
       }
     });
 
     if (tasks.length > 0) {
-      // Generar embeddings eficientemente en lote con batchEmbedContents y el RateLimitManager
       const taskTexts = tasks.map((t) => t.queryText);
       const generatedVectors = await generateEmbeddingsBatch(taskTexts, {
         apiKey,
@@ -313,143 +267,196 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // ── CARGA MULTI-VECTOR DE ASIGNATURAS CANDIDATAS ──
+    // Cargamos asignaturas objetivo (filtradas o catálogo completo) con todas sus columnas de vectores
+    interface TargetAsignatura {
+      id: number;
+      clave: string;
+      nombre: string;
+      cluster: string | null;
+      contenido_tematico: string;
+      match_nombre: boolean;
+      vectorsMap: Record<string, number[]>;
+      primaryEmbedding: number[] | null;
+    }
+
+    const selectColumns = `id, clave, nombre, contenido_tematico, match_nombre, embedding_768, vectors, cluster${
+      clusterColumn && clusterColumn !== "cluster" ? `, ${clusterColumn}` : ""
+    }`;
+
+    let targetRows: any[] = [];
+    try {
+      let queryBuilder = supabase.from("asignaturas").select(selectColumns);
+      if (hasFilter) {
+        queryBuilder = queryBuilder.in("id", filterAsignaturaIds);
+      }
+      const { data, error } = await queryBuilder;
+      if (error) {
+        // Fallback si la columna 'vectors' no existe aún en la base de datos
+        if (error.message?.includes("vectors") || error.code === "42703") {
+          const fallbackCols = selectColumns.replace(", vectors", "").replace("vectors,", "");
+          let fbQuery = supabase.from("asignaturas").select(fallbackCols);
+          if (hasFilter) fbQuery = fbQuery.in("id", filterAsignaturaIds);
+          const { data: fbData, error: fbErr } = await fbQuery;
+          if (fbErr) throw fbErr;
+          targetRows = fbData || [];
+        } else {
+          throw error;
+        }
+      } else {
+        targetRows = data || [];
+      }
+    } catch (fetchErr: any) {
+      throw new Error(`Error al consultar asignaturas en Supabase: ${fetchErr.message}`);
+    }
+
+    // Procesar y validar vectores de cada asignatura
+    const targetAsignaturas: TargetAsignatura[] = targetRows
+      .map((r: any) => {
+        const vectorsMap: Record<string, number[]> = {};
+
+        // 1. Vector principal embedding_768
+        let primaryEmb = r.embedding_768;
+        if (typeof primaryEmb === "string") {
+          try {
+            primaryEmb = JSON.parse(primaryEmb);
+          } catch {
+            primaryEmb = null;
+          }
+        }
+        if (Array.isArray(primaryEmb) && primaryEmb.length === 768) {
+          vectorsMap["embedding_768"] = primaryEmb;
+        } else {
+          primaryEmb = null;
+        }
+
+        // 2. Vectores almacenados en la columna JSONB 'vectors'
+        if (r.vectors && typeof r.vectors === "object") {
+          for (const [vKey, vVal] of Object.entries(r.vectors)) {
+            let vec: number[] | null = null;
+            if (Array.isArray(vVal) && vVal.length === 768) {
+              vec = vVal;
+            } else if (typeof vVal === "string") {
+              try {
+                const parsed = JSON.parse(vVal);
+                if (Array.isArray(parsed) && parsed.length === 768) vec = parsed;
+              } catch {
+                vec = null;
+              }
+            }
+            if (vec) {
+              vectorsMap[vKey] = vec;
+            }
+          }
+        }
+
+        // 3. Revisar si hay columnas dedicadas que contengan vectores
+        activePairs.forEach((pair) => {
+          if (!vectorsMap[pair.asigVectorCol] && r[pair.asigVectorCol]) {
+            let colVal = r[pair.asigVectorCol];
+            if (typeof colVal === "string") {
+              try {
+                colVal = JSON.parse(colVal);
+              } catch {
+                colVal = null;
+              }
+            }
+            if (Array.isArray(colVal) && colVal.length === 768) {
+              vectorsMap[pair.asigVectorCol] = colVal;
+            }
+          }
+        });
+
+        // Si embedding_768 no existía pero hay otro vector, usarlo como principal
+        if (!primaryEmb && Object.keys(vectorsMap).length > 0) {
+          primaryEmb = Object.values(vectorsMap)[0];
+        }
+
+        const rawClusterVal = r[clusterColumn] !== undefined ? r[clusterColumn] : r.cluster;
+        const cleanCluster = rawClusterVal != null && String(rawClusterVal).trim() !== "" ? String(rawClusterVal).trim() : null;
+
+        return {
+          id: r.id,
+          clave: r.clave || "",
+          nombre: r.nombre || "",
+          cluster: cleanCluster,
+          contenido_tematico: r.contenido_tematico || "",
+          match_nombre: Boolean(r.match_nombre),
+          vectorsMap,
+          primaryEmbedding: primaryEmb,
+        };
+      })
+      .filter((a) => Object.keys(a.vectorsMap).length > 0);
+
+    if (targetAsignaturas.length === 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Ninguna de las asignaturas tiene vectores disponibles (se requieren vectores de 768 dimensiones).",
+        },
+        { status: 400 }
+      );
+    }
+
     const results: ProfesorMatchResult[] = [];
 
-    // Procesar matching de cada profesor con sus embeddings ya calculados
+    // ── PROCESAMIENTO DE MATCHING PONDERADO MULTI-VECTOR ──
     for (let pIdx = 0; pIdx < profesores.length; pIdx++) {
       const prof = profesores[pIdx];
       const fieldEmbeddings = profFieldEmbeddings[pIdx] || {};
 
       try {
-        // Calcular vector compuesto del profesor
+        // Calcular vector compuesto del profesor (usado para visualización y exportación)
         const compositeEmbedding = prof.embedding_768 && prof.embedding_768.length === 768
           ? prof.embedding_768
-          : computeCompositeEmbedding(fieldEmbeddings, weightMap);
+          : computeCompositeEmbedding(fieldEmbeddings, pairWeightMap);
 
-        // Mapa temporal: asignaturaId -> { id, clave, nombre, cluster, contenido_tematico, match_nombre, fieldSims }
-        const candidateMap = new Map<
-          number,
-          {
-            id: number;
-            clave: string;
-            nombre: string;
-            cluster?: string | null;
-            contenido_tematico: string;
-            match_nombre?: boolean;
-            fieldSims: Record<string, number>;
-          }
-        >();
-
-        // Para cada criterio activo que tenga embedding disponible
-        for (const config of normalizedConfigs) {
-          const embedding = fieldEmbeddings[config.field];
-          if (!embedding) continue;
-
-          if (targetAsignaturas && targetAsignaturas.length > 0) {
-            // MODO FILTRADO: La matriz de distancias solo se corre sobre las asignaturas filtradas
-            for (const target of targetAsignaturas) {
-              const sim = computeCosineSimilarity(embedding, target.embedding);
-              const current = candidateMap.get(target.id) || {
-                id: target.id,
-                clave: target.clave,
-                nombre: target.nombre,
-                cluster: target.cluster,
-                contenido_tematico: target.contenido_tematico,
-                match_nombre: target.match_nombre,
-                fieldSims: {} as Record<string, number>,
-              };
-              current.fieldSims[config.field] = sim;
-              candidateMap.set(target.id, current);
-            }
-          } else {
-            // MODO CATÁLOGO COMPLETO: Consultar match_asignaturas_cosine en Supabase
-            const { data: matches, error: rpcError } = await supabase.rpc("match_asignaturas_cosine", {
-              query_embedding: embedding,
-              match_count: Math.max(500, topK * 2),
-              similarity_threshold: 0.0,
-            });
-
-            if (rpcError) {
-              console.error("Error en RPC match_asignaturas_cosine:", rpcError);
-              throw new Error(`Error en Supabase RPC match_asignaturas_cosine: ${rpcError.message}`);
-            }
-
-            if (Array.isArray(matches)) {
-              for (const item of matches) {
-                const current = candidateMap.get(item.id) || {
-                  id: item.id,
-                  clave: item.clave || "",
-                  nombre: item.nombre || "",
-                  cluster: (item as any).cluster || null,
-                  contenido_tematico: item.contenido_tematico || "",
-                  match_nombre: Boolean(item.match_nombre),
-                  fieldSims: {} as Record<string, number>,
-                };
-                current.fieldSims[config.field] = Number(item.similarity) || 0;
-                candidateMap.set(item.id, current);
-              }
-            }
-          }
-        }
-
-        // Si no estábamos en modo filtrado, asegurar banderas match_nombre y columna cluster
-        if (!targetAsignaturas) {
-          const candidateIds = Array.from(candidateMap.keys());
-          if (candidateIds.length > 0) {
-            const selectCandidateFields = `id, match_nombre, cluster${
-              clusterColumn && clusterColumn !== "cluster" ? `, ${clusterColumn}` : ""
-            }`;
-            const { data: flagRows } = await supabase
-              .from("asignaturas")
-              .select(selectCandidateFields)
-              .in("id", candidateIds);
-
-            if (Array.isArray(flagRows)) {
-              flagRows.forEach((r: any) => {
-                const item = candidateMap.get(r.id);
-                if (item) {
-                  item.match_nombre = Boolean(r.match_nombre);
-                  const rawClVal = r[clusterColumn] !== undefined ? r[clusterColumn] : r.cluster;
-                  if (rawClVal != null && String(rawClVal).trim() !== "") {
-                    item.cluster = String(rawClVal).trim();
-                  }
-                }
-              });
-            }
-          }
-        }
-
-        // Calcular similitud compuesta ponderada usando los BETAS ESPECÍFICOS DEL CLUSTER de la asignatura
         const scoredItems: MatchResultItem[] = [];
 
-        for (const candidate of candidateMap.values()) {
-          let compositeSim = 0;
-          const cName = candidate.cluster ? String(candidate.cluster).trim() : "";
-          const candidateWeights = (cName && normalizedClusterBetas[cName]) || normalizedDefaultBetas;
+        // Evaluar cada asignatura candidata contra todos los pares activos
+        for (const target of targetAsignaturas) {
+          const pairSims: Record<string, number> = {};
 
-          for (const config of normalizedConfigs) {
-            const sim = candidate.fieldSims[config.field] || 0;
-            const w = typeof candidateWeights[config.field] === "number" ? candidateWeights[config.field] : config.normalizedWeight;
+          for (const pair of activePairs) {
+            const profVec = fieldEmbeddings[pair.profField];
+            // Resolver vector de asignatura para este par (columna específica o fallback a embedding_768)
+            const asigVec = target.vectorsMap[pair.asigVectorCol] || target.vectorsMap["embedding_768"] || target.primaryEmbedding;
+
+            if (profVec && asigVec) {
+              const sim = computeCosineSimilarity(profVec, asigVec);
+              pairSims[pair.id] = Number(sim.toFixed(4));
+            } else {
+              pairSims[pair.id] = 0;
+            }
+          }
+
+          // Obtener pesos específicos del cluster de esta asignatura
+          const cName = target.cluster ? String(target.cluster).trim() : "";
+          const clusterWeights = (cName && normalizedClusterBetas[cName]) || normalizedDefaultBetas;
+
+          let compositeSim = 0;
+          for (const pair of activePairs) {
+            const sim = pairSims[pair.id] || 0;
+            const w = typeof clusterWeights[pair.id] === "number" ? clusterWeights[pair.id] : pairWeightMap[pair.id];
             compositeSim += w * sim;
           }
 
           // Validación según el modo de filtrado seleccionado por el usuario
-          const passesFilter =
-            filterMode === "topK" ? true : compositeSim >= threshold;
+          const passesFilter = filterMode === "topK" ? true : compositeSim >= threshold;
 
           if (passesFilter) {
             scoredItems.push({
-              asignaturaId: candidate.id,
-              clave: candidate.clave,
-              nombre: candidate.nombre,
-              cluster: candidate.cluster || null,
-              contenido_tematico: candidate.contenido_tematico,
+              asignaturaId: target.id,
+              clave: target.clave,
+              nombre: target.nombre,
+              cluster: target.cluster,
+              contenido_tematico: target.contenido_tematico,
               compositeSimilarity: Number(compositeSim.toFixed(4)),
-              fieldSimilarities: Object.fromEntries(
-                Object.entries(candidate.fieldSims).map(([k, v]) => [k, Number(v.toFixed(4))])
-              ),
-              match_nombre: Boolean(candidate.match_nombre),
-              embedding_768: null, // Se asignará en el paso final de resolución vectorial
+              fieldSimilarities: pairSims,
+              pairSimilarities: pairSims,
+              match_nombre: Boolean(target.match_nombre),
+              embedding_768: target.primaryEmbedding,
+              vectors: target.vectorsMap,
             });
           }
         }
@@ -457,31 +464,31 @@ export async function POST(req: NextRequest) {
         // Ordenar candidatos de MAYOR A MENOR similitud compuesta
         scoredItems.sort((a, b) => b.compositeSimilarity - a.compositeSimilarity);
 
-        // Selección final de asignaturas respetando cupo Top K y match_nombre
+        // Selección final de asignaturas respetando cupo Top K y prioridad match_nombre
         let finalMatches: MatchResultItem[] = [];
 
         if (filterMode === "threshold") {
           if (topK > 0 && topK < scoredItems.length) {
-            let semanticCount = 0;
+            let count = 0;
             for (const item of scoredItems) {
               if (item.match_nombre) {
                 finalMatches.push(item);
-              } else if (semanticCount < topK) {
+              } else if (count < topK) {
                 finalMatches.push(item);
-                semanticCount++;
+                count++;
               }
             }
           } else {
             finalMatches = scoredItems;
           }
         } else {
-          let semanticCount = 0;
+          let count = 0;
           for (const item of scoredItems) {
             if (item.match_nombre) {
               finalMatches.push(item);
-            } else if (semanticCount < topK) {
+            } else if (count < topK) {
               finalMatches.push(item);
-              semanticCount++;
+              count++;
             }
           }
         }
@@ -509,64 +516,12 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── OBTENCIÓN Y ASIGNACIÓN DE EMBEDDINGS DE ASIGNATURAS ──
-    // Asegurar que cada asignatura recomendada tenga su vector de 768d incluido para descarga
-    if (targetAsignaturas && targetAsignaturas.length > 0) {
-      // Modo filtrado: los embeddings ya estaban en memoria
-      const targetVectorMap = new Map<number, number[]>();
-      targetAsignaturas.forEach((t) => {
-        if (Array.isArray(t.embedding)) {
-          targetVectorMap.set(t.id, t.embedding);
-        }
-      });
-
-      for (const res of results) {
-        for (const match of res.matches) {
-          match.embedding_768 = targetVectorMap.get(match.asignaturaId) || null;
-        }
-      }
-    } else {
-      // Modo catálogo completo: consultar los vectores de las asignaturas ganadoras en Supabase
-      const allMatchedIds = Array.from(
-        new Set(results.flatMap((r) => r.matches.map((m) => m.asignaturaId)))
-      );
-
-      if (allMatchedIds.length > 0) {
-        const { data: subjectRows, error: subVectorErr } = await supabase
-          .from("asignaturas")
-          .select("id, embedding_768")
-          .in("id", allMatchedIds);
-
-        if (!subVectorErr && Array.isArray(subjectRows)) {
-          const subjectVectorMap = new Map<number, number[]>();
-          subjectRows.forEach((r) => {
-            let emb = r.embedding_768;
-            if (typeof emb === "string") {
-              try {
-                emb = JSON.parse(emb);
-              } catch {
-                emb = null;
-              }
-            }
-            if (Array.isArray(emb) && emb.length === 768) {
-              subjectVectorMap.set(r.id, emb);
-            }
-          });
-
-          for (const res of results) {
-            for (const match of res.matches) {
-              match.embedding_768 = subjectVectorMap.get(match.asignaturaId) || null;
-            }
-          }
-        }
-      }
-    }
-
     return NextResponse.json({
       success: true,
       results,
       count: results.length,
-      filteredSubjectCount: targetAsignaturas ? targetAsignaturas.length : null,
+      filteredSubjectCount: hasFilter ? targetAsignaturas.length : null,
+      totalCatalogProcessed: targetAsignaturas.length,
       rateLimiterStats: geminiRateLimiter.getStats(),
     });
   } catch (error: any) {

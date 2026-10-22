@@ -49,27 +49,39 @@ export async function POST(req: NextRequest) {
     const PAGE_SIZE = 1000;
     const numPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
-    // Descargar metadatos básicos en paralelo
-    const pagePromises = [];
-    for (let i = 0; i < numPages; i++) {
-      const from = i * PAGE_SIZE;
-      const to = from + PAGE_SIZE - 1;
-      pagePromises.push(
-        supabase
-          .from("asignaturas")
-          .select("id, clave, nombre, cluster, contenido_tematico, match_nombre")
-          .range(from, to)
-      );
-    }
+    // Descargar metadatos básicos en paralelo con soporte multi-vector
+    let selectFields = "id, clave, nombre, cluster, contenido_tematico, match_nombre, embedding_768, vectors";
+    let allRows: any[] = [];
 
-    const pageResults = await Promise.all(pagePromises);
-    const allRows: any[] = [];
-    for (const res of pageResults) {
-      if (res.error) {
-        throw new Error(`Error al leer asignaturas: ${res.error.message}`);
+    const fetchPages = async (fields: string) => {
+      const pagePromises = [];
+      for (let i = 0; i < numPages; i++) {
+        const from = i * PAGE_SIZE;
+        const to = from + PAGE_SIZE - 1;
+        pagePromises.push(
+          supabase
+            .from("asignaturas")
+            .select(fields)
+            .range(from, to)
+        );
       }
-      if (Array.isArray(res.data)) {
-        allRows.push(...res.data);
+      const pageResults = await Promise.all(pagePromises);
+      const rows: any[] = [];
+      for (const res of pageResults) {
+        if (res.error) throw res.error;
+        if (Array.isArray(res.data)) rows.push(...res.data);
+      }
+      return rows;
+    };
+
+    try {
+      allRows = await fetchPages(selectFields);
+    } catch (pageErr: any) {
+      if (pageErr.message?.includes("vectors") || pageErr.code === "42703") {
+        selectFields = "id, clave, nombre, cluster, contenido_tematico, match_nombre, embedding_768";
+        allRows = await fetchPages(selectFields);
+      } else {
+        throw pageErr;
       }
     }
 
@@ -81,6 +93,14 @@ export async function POST(req: NextRequest) {
     for (const row of allRows) {
       const cClean = cleanClave(row.clave);
       if (cClean && inputSet.has(cClean)) {
+        const vCols: string[] = [];
+        if (row.embedding_768) vCols.push("embedding_768");
+        if (row.vectors && typeof row.vectors === "object") {
+          Object.keys(row.vectors).forEach((vk) => {
+            if (!vCols.includes(vk)) vCols.push(vk);
+          });
+        }
+
         matchedAsignaturas.push({
           id: row.id,
           clave: row.clave,
@@ -89,7 +109,9 @@ export async function POST(req: NextRequest) {
           cluster: row.cluster || null,
           contenido_tematico: row.contenido_tematico || "",
           match_nombre: Boolean(row.match_nombre),
-          hasEmbedding: true,
+          hasEmbedding: vCols.length > 0 || Boolean(row.embedding_768),
+          vectors: row.vectors || null,
+          vectorColumns: vCols,
         });
         matchedIds.push(row.id);
         matchedCleanClaves.add(cClean);

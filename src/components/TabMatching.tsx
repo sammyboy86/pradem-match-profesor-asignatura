@@ -36,6 +36,9 @@ import {
   Copy,
   RotateCcw,
   Info,
+  ArrowRightLeft,
+  GitCompare,
+  Link2,
 } from "lucide-react";
 import {
   Profesor,
@@ -47,6 +50,7 @@ import {
   FilterClavesResponse,
   ProfessorImportMode,
   RegexFilterConfig,
+  DistancePairConfig,
 } from "@/types";
 import {
   DEFAULT_REGEX_FILTER_CONFIG,
@@ -81,6 +85,12 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [defaultBetas, setDefaultBetas] = useState<Record<string, number>>({});
   const [newClusterName, setNewClusterName] = useState<string>("");
   const [isLoadingClusters, setIsLoadingClusters] = useState<boolean>(false);
+
+  // ── Configuración de Pares de Distancia Multi-Vector (Profesor ↔ Asignatura) ──
+  const [availableAsigVectorCols, setAvailableAsigVectorCols] = useState<string[]>(["embedding_768"]);
+  const [distancePairs, setDistancePairs] = useState<DistancePairConfig[]>([]);
+  const [newPairProfField, setNewPairProfField] = useState<string>("");
+  const [newPairAsigCol, setNewPairAsigCol] = useState<string>("");
   // ── Estados de Filtro Inicial de Asignaturas (Paso 1: Filtro por Claves) ──
   const [filterFile, setFilterFile] = useState<File | null>(null);
   const [filterHeaders, setFilterHeaders] = useState<string[]>([]);
@@ -178,9 +188,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   useEffect(() => {
     async function loadCatalogCount() {
       try {
-        const res = await apiFetch<{ success: boolean; totalCount?: number }>("/api/asignaturas?limit=1");
+        const res = await apiFetch<{
+          success: boolean;
+          totalCount?: number;
+          availableVectorColumns?: string[];
+        }>("/api/asignaturas?limit=1");
         if (typeof res.totalCount === "number" && res.totalCount > 0) {
           setTotalCatalogCount(res.totalCount);
+        }
+        if (Array.isArray(res.availableVectorColumns) && res.availableVectorColumns.length > 0) {
+          setAvailableAsigVectorCols(res.availableVectorColumns);
         }
       } catch (err) {
         console.warn("No se pudo obtener conteo de asignaturas:", err);
@@ -207,19 +224,28 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       if (isFilterActive && filteredAsignaturas.length > 0) {
         // Extraer de las asignaturas filtradas
         const clustersSet = new Set<string>();
+        const vectorColsSet = new Set<string>(["embedding_768"]);
         filteredAsignaturas.forEach((a) => {
           const val = (a as any)[colName] || a.cluster;
           if (val && String(val).trim()) {
             clustersSet.add(String(val).trim());
           }
+          if (Array.isArray(a.vectorColumns)) {
+            a.vectorColumns.forEach((c) => vectorColsSet.add(c));
+          }
+          if (a.vectors && typeof a.vectors === "object") {
+            Object.keys(a.vectors).forEach((k) => vectorColsSet.add(k));
+          }
         });
         setDetectedClusters(Array.from(clustersSet).sort());
+        setAvailableAsigVectorCols(Array.from(vectorColsSet));
       } else {
         // Consultar el endpoint de clusters
         const data = await apiFetch<{
           success: boolean;
           availableColumns: string[];
           clusters: string[];
+          availableVectorColumns?: string[];
         }>(`/api/asignaturas/clusters?column=${encodeURIComponent(colName)}`);
 
         if (data.success) {
@@ -228,6 +254,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           }
           if (Array.isArray(data.clusters)) {
             setDetectedClusters(data.clusters);
+          }
+          if (Array.isArray(data.availableVectorColumns) && data.availableVectorColumns.length > 0) {
+            setAvailableAsigVectorCols(data.availableVectorColumns);
           }
         }
       }
@@ -251,27 +280,142 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     return queryConfigs.filter((c) => c.active).map((c) => c.field);
   }, [queryConfigs]);
 
-  // Asegurar que defaultBetas y cada cluster tengan valores válidos que sumen 100%
+  // Pares de distancia activos (cuyo campo docente esté activo en queryConfigs y el par esté marcado como activo)
+  const activePairs = useMemo(() => {
+    return distancePairs.filter(
+      (p) => p.active !== false && activeFields.includes(p.profField)
+    );
+  }, [distancePairs, activeFields]);
+
+  // Auto-sincronizar distancePairs cuando cambian los campos activos o las columnas vectoriales
   useEffect(() => {
     if (!activeFields.length) return;
+
+    setDistancePairs((prev) => {
+      const existing = [...prev];
+      const primaryCol = availableAsigVectorCols[0] || "embedding_768";
+      let changed = false;
+
+      // Garantizar que cada campo activo tenga al menos un par
+      activeFields.forEach((profField) => {
+        const hasPair = existing.some((p) => p.profField === profField);
+        if (!hasPair) {
+          const cfg = queryConfigs.find((c) => c.field === profField);
+          const pairId = `${profField}__${primaryCol}`;
+          if (!existing.some((p) => p.id === pairId)) {
+            existing.push({
+              id: pairId,
+              profField,
+              asigVectorCol: primaryCol,
+              label: `${cfg?.label || profField} ↔ ${primaryCol}`,
+              active: true,
+              weight: cfg && cfg.weight > 0 ? cfg.weight : 1,
+            });
+            changed = true;
+          }
+        }
+      });
+
+      return changed ? existing : prev;
+    });
+  }, [activeFields, availableAsigVectorCols, queryConfigs]);
+
+  // Acciones de gestión de pares de distancia
+  const handleAddDistancePair = () => {
+    if (!newPairProfField || !newPairAsigCol) return;
+    const pairId = `${newPairProfField}__${newPairAsigCol}`;
+    if (distancePairs.some((p) => p.id === pairId)) {
+      alert("Este par de distancia ya existe en la configuración.");
+      return;
+    }
+    const profCfg = queryConfigs.find((c) => c.field === newPairProfField);
+    const newPair: DistancePairConfig = {
+      id: pairId,
+      profField: newPairProfField,
+      asigVectorCol: newPairAsigCol,
+      label: `${profCfg?.label || newPairProfField} ↔ ${newPairAsigCol}`,
+      active: true,
+      weight: profCfg && profCfg.weight > 0 ? profCfg.weight : 1,
+    };
+    setDistancePairs((prev) => [...prev, newPair]);
+    setNewPairProfField("");
+    setNewPairAsigCol("");
+  };
+
+  const handleTogglePairActive = (pairId: string) => {
+    setDistancePairs((prev) =>
+      prev.map((p) => (p.id === pairId ? { ...p, active: !p.active } : p))
+    );
+  };
+
+  const handleRemoveDistancePair = (pairId: string) => {
+    setDistancePairs((prev) => prev.filter((p) => p.id !== pairId));
+  };
+
+  const handleResetPairsToOneToOne = () => {
+    const primaryCol = availableAsigVectorCols[0] || "embedding_768";
+    const pairs: DistancePairConfig[] = activeFields.map((f) => {
+      const cfg = queryConfigs.find((c) => c.field === f);
+      return {
+        id: `${f}__${primaryCol}`,
+        profField: f,
+        asigVectorCol: primaryCol,
+        label: `${cfg?.label || f} ↔ ${primaryCol}`,
+        active: true,
+        weight: cfg && cfg.weight > 0 ? cfg.weight : 1,
+      };
+    });
+    setDistancePairs(pairs);
+  };
+
+  const handleCrossAllPairs = () => {
+    const pairs: DistancePairConfig[] = [];
+    activeFields.forEach((f) => {
+      const cfg = queryConfigs.find((c) => c.field === f);
+      availableAsigVectorCols.forEach((col) => {
+        pairs.push({
+          id: `${f}__${col}`,
+          profField: f,
+          asigVectorCol: col,
+          label: `${cfg?.label || f} ↔ ${col}`,
+          active: true,
+          weight: cfg && cfg.weight > 0 ? cfg.weight : 1,
+        });
+      });
+    });
+    setDistancePairs(pairs);
+  };
+
+  // Asegurar que defaultBetas y cada cluster tengan valores válidos que sumen 100% sobre activePairs
+  useEffect(() => {
+    if (!activePairs.length) return;
 
     setDefaultBetas((prev) => {
       const next = { ...prev };
       let missingCount = 0;
-      activeFields.forEach((f) => {
-        if (typeof next[f] !== "number") missingCount++;
+      activePairs.forEach((p) => {
+        if (typeof next[p.id] !== "number") {
+          if (typeof next[p.profField] === "number") {
+            next[p.id] = next[p.profField];
+          } else {
+            missingCount++;
+          }
+        }
       });
 
       if (missingCount > 0 || Object.keys(next).length === 0) {
-        const totalW = activeFields.reduce((acc, f) => {
-          const cfg = queryConfigs.find((c) => c.field === f);
-          return acc + (cfg && cfg.weight > 0 ? cfg.weight : 0);
+        const totalW = activePairs.reduce((acc, p) => {
+          const cfg = queryConfigs.find((c) => c.field === p.profField);
+          const w = p.weight ?? (cfg && cfg.weight > 0 ? cfg.weight : 1);
+          return acc + w;
         }, 0);
 
-        activeFields.forEach((f) => {
-          const cfg = queryConfigs.find((c) => c.field === f);
-          const w = cfg && cfg.weight > 0 ? cfg.weight : 1;
-          next[f] = totalW > 0 ? Math.round((w / totalW) * 100) : Math.round(100 / activeFields.length);
+        activePairs.forEach((p) => {
+          if (typeof next[p.id] !== "number") {
+            const cfg = queryConfigs.find((c) => c.field === p.profField);
+            const w = p.weight ?? (cfg && cfg.weight > 0 ? cfg.weight : 1);
+            next[p.id] = totalW > 0 ? Math.round((w / totalW) * 100) : Math.round(100 / activePairs.length);
+          }
         });
       }
       return next;
@@ -283,76 +427,91 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         if (!next[cluster]) {
           next[cluster] = {};
         }
-        activeFields.forEach((f) => {
-          if (typeof next[cluster][f] !== "number") {
-            const defVal = defaultBetas[f];
-            next[cluster][f] = typeof defVal === "number" ? defVal : Math.round(100 / activeFields.length);
+        activePairs.forEach((p) => {
+          if (typeof next[cluster][p.id] !== "number") {
+            if (typeof next[cluster][p.profField] === "number") {
+              next[cluster][p.id] = next[cluster][p.profField];
+            } else {
+              const defVal = defaultBetas[p.id] ?? defaultBetas[p.profField];
+              next[cluster][p.id] = typeof defVal === "number" ? defVal : Math.round(100 / activePairs.length);
+            }
           }
         });
       });
       return next;
     });
-  }, [activeFields, allClustersList]);
+  }, [activePairs, allClustersList, queryConfigs, defaultBetas]);
 
-  // Actualizar un peso beta individual
-  const handleUpdateBeta = (clusterKey: string, field: string, value: number) => {
+  // Actualizar un peso beta individual (key puede ser pair.id o field)
+  const handleUpdateBeta = (clusterKey: string, key: string, value: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(value)));
     if (clusterKey === "__default__") {
-      setDefaultBetas((prev) => ({ ...prev, [field]: clamped }));
+      setDefaultBetas((prev) => ({ ...prev, [key]: clamped }));
     } else {
       setClusterBetas((prev) => ({
         ...prev,
         [clusterKey]: {
           ...(prev[clusterKey] || {}),
-          [field]: clamped,
+          [key]: clamped,
         },
       }));
     }
   };
 
-  // Normalizar los betas del cluster activo para que sumen exactamente 100%
+  // Normalizar los betas del cluster activo para que sumen exactamente 100% sobre activePairs
   const handleNormalizeBetas = (clusterKey: string) => {
     const current = clusterKey === "__default__" ? defaultBetas : clusterBetas[clusterKey] || {};
-    const total = activeFields.reduce((acc, f) => acc + (current[f] || 0), 0);
+    const total = activePairs.reduce(
+      (acc, p) => acc + (current[p.id] ?? current[p.profField] ?? 0),
+      0
+    );
     if (total === 0) {
-      const eq = Math.round(100 / activeFields.length);
-      activeFields.forEach((f) => handleUpdateBeta(clusterKey, f, eq));
+      const eq = Math.round(100 / activePairs.length);
+      activePairs.forEach((p) => handleUpdateBeta(clusterKey, p.id, eq));
       return;
     }
     const updated: Record<string, number> = {};
     let running = 0;
-    activeFields.forEach((f, idx) => {
-      if (idx === activeFields.length - 1) {
-        updated[f] = Math.max(0, 100 - running);
+    activePairs.forEach((p, idx) => {
+      if (idx === activePairs.length - 1) {
+        updated[p.id] = Math.max(0, 100 - running);
       } else {
-        const val = Math.round(((current[f] || 0) / total) * 100);
-        updated[f] = val;
+        const val = Math.round(
+          (((current[p.id] ?? current[p.profField] ?? 0) / total) * 100)
+        );
+        updated[p.id] = val;
         running += val;
       }
     });
 
     if (clusterKey === "__default__") {
-      setDefaultBetas(updated);
+      setDefaultBetas((prev) => ({ ...prev, ...updated }));
     } else {
-      setClusterBetas((prev) => ({ ...prev, [clusterKey]: updated }));
+      setClusterBetas((prev) => ({
+        ...prev,
+        [clusterKey]: { ...(prev[clusterKey] || {}), ...updated },
+      }));
     }
   };
 
-  // Distribuir equitativamente entre los campos activos
+  // Distribuir equitativamente entre los pares activos
   const handleEquiDistribute = (clusterKey: string) => {
-    const count = activeFields.length;
+    const count = activePairs.length;
     if (count === 0) return;
     const base = Math.floor(100 / count);
     const remainder = 100 - base * count;
     const updated: Record<string, number> = {};
-    activeFields.forEach((f, idx) => {
-      updated[f] = idx === 0 ? base + remainder : base;
+    activePairs.forEach((p, idx) => {
+      updated[p.id] = idx === 0 ? base + remainder : base;
     });
 
     if (clusterKey === "__default__") {
-      setDefaultBetas(updated);
+      setDefaultBetas((prev) => ({ ...prev, ...updated }));
     } else {
-      setClusterBetas((prev) => ({ ...prev, [clusterKey]: updated }));
+      setClusterBetas((prev) => ({
+        ...prev,
+        [clusterKey]: { ...(prev[clusterKey] || {}), ...updated },
+      }));
     }
   };
 
@@ -453,6 +612,18 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         setFilteredAsignaturas(res.matchedAsignaturas || []);
         setUnmatchedClaves(res.unmatchedClaves || []);
         setIsFilterActive(true);
+        if (res.matchedAsignaturas && res.matchedAsignaturas.length > 0) {
+          const vectorColsSet = new Set<string>(["embedding_768"]);
+          res.matchedAsignaturas.forEach((a) => {
+            if (Array.isArray(a.vectorColumns)) {
+              a.vectorColumns.forEach((c) => vectorColsSet.add(c));
+            }
+            if (a.vectors && typeof a.vectors === "object") {
+              Object.keys(a.vectors).forEach((k) => vectorColsSet.add(k));
+            }
+          });
+          setAvailableAsigVectorCols(Array.from(vectorColsSet));
+        }
       } else {
         setFilterError(res.error || "Error al buscar asignaturas por claves en el catálogo.");
       }
@@ -765,6 +936,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           body: JSON.stringify({
             profesores: batch,
             queryConfigs: activeConfigs,
+            distancePairs: activePairs,
             filterMode,
             threshold: filterMode === "topK" ? 0.0 : threshold,
             topK: filterMode === "threshold" ? (effectiveCatalogCount || 500) : topK,
@@ -1080,19 +1252,39 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           rowData[`${prefix} - Tipo`] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
           rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
 
+          // Desglose por par de distancia (multi-vector)
+          if (m.pairSimilarities && Object.keys(m.pairSimilarities).length > 0) {
+            const desglosePares = Object.entries(m.pairSimilarities)
+              .map(([pairKey, score]) => {
+                const pairCfg = distancePairs.find((p) => p.id === pairKey);
+                const label = pairCfg?.label || pairKey;
+                return `${label}: ${(score * 100).toFixed(0)}%`;
+              })
+              .join(" | ");
+            rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = desglosePares;
+          }
+
           // Desglose por criterio
           const desglose = Object.entries(m.fieldSimilarities)
             .map(([field, score]) => `${field}: ${(score * 100).toFixed(0)}%`)
             .join(" | ");
           rowData[`${prefix} - Desglose`] = desglose;
 
-          // Embedding 768d de la Asignatura recomendada
+          // Embedding principal 768d de la Asignatura recomendada
           rowData[`${prefix} - Embedding Asignatura`] = formatEmbeddingForExport(m.embedding_768);
+
+          // Embeddings vectoriales adicionales de la Asignatura si existen
+          if (m.vectors && typeof m.vectors === "object") {
+            Object.entries(m.vectors).forEach(([vCol, vVec]) => {
+              rowData[`${prefix} - Vector Asig (${vCol})`] = formatEmbeddingForExport(vVec);
+            });
+          }
         } else {
           rowData[`${prefix} - Asignatura`] = "—";
           rowData[`${prefix} - Clave`] = "—";
           rowData[`${prefix} - Cluster`] = "—";
           rowData[`${prefix} - Similitud Compuesta`] = "—";
+          rowData[`${prefix} - Desglose Pares (Multi-Vector)`] = "—";
           rowData[`${prefix} - Desglose`] = "—";
           rowData[`${prefix} - Embedding Asignatura`] = "—";
         }
@@ -1884,6 +2076,185 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             })}
           </div>
 
+          {/* ── SECCIÓN DE CONFIGURACIÓN DE PARES DE DISTANCIA (MULTI-VECTOR) ── */}
+          <div className="rounded-xl border border-indigo-500/30 bg-slate-950/90 p-5 space-y-4 shadow-lg shadow-indigo-500/5">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase text-indigo-300 flex items-center gap-1">
+                    <GitCompare className="h-3 w-3" />
+                    Multi-Vector &bull; Distancias
+                  </span>
+                  <h4 className="text-sm font-bold text-white tracking-tight">
+                    Configuración de Pares de Distancia (Profesor ⟷ Asignatura)
+                  </h4>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Define qué columna vectorial de las asignaturas se comparará contra cada campo del docente. Puedes crear múltiples pares para ponderar diferentes dimensiones temáticas y pedagógicas.
+                </p>
+              </div>
+
+              {/* Badges de columnas y pares */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-xs font-mono text-cyan-300 flex items-center gap-1.5">
+                  <Cpu className="h-3 w-3" />
+                  {availableAsigVectorCols.length} vect. asignatura
+                </span>
+                <span className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1 text-xs font-mono text-indigo-300 flex items-center gap-1.5">
+                  <Link2 className="h-3 w-3" />
+                  {activePairs.length} pares activos
+                </span>
+              </div>
+            </div>
+
+            {/* Acciones Rápidas de Auto-vinculación */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
+              <span className="text-xs text-slate-400">
+                Pares vinculados actualmente ({distancePairs.length}):
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleResetPairsToOneToOne}
+                  className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
+                  title="Crea una vinculación 1 a 1 entre cada campo docente activo y la columna vectorial primaria"
+                >
+                  <RotateCcw className="h-3 w-3 text-cyan-400" />
+                  <span>Auto-vincular 1 a 1</span>
+                </button>
+                {availableAsigVectorCols.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={handleCrossAllPairs}
+                    className="flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 px-2.5 py-1 text-[11px] font-medium text-indigo-300 transition cursor-pointer"
+                    title="Crea todas las combinaciones posibles entre campos docentes activos y columnas de asignatura"
+                  >
+                    <Layers className="h-3 w-3 text-indigo-400" />
+                    <span>Cruzar Todos (Matriz Completa)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Lista de Pares Configurados */}
+            {distancePairs.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-white/10 bg-slate-900/40 p-4 text-center text-xs text-slate-400">
+                No hay pares de distancia configurados. Pulsa en <strong className="text-cyan-300 font-semibold">Auto-vincular 1 a 1</strong> o agrega uno manualmente abajo.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 max-h-72 overflow-y-auto pr-1">
+                {distancePairs.map((pair) => {
+                  const isProfActive = activeFields.includes(pair.profField);
+                  return (
+                    <div
+                      key={pair.id}
+                      className={`flex items-center justify-between gap-2 rounded-lg border p-2.5 transition ${
+                        pair.active && isProfActive
+                          ? "border-indigo-500/40 bg-slate-900/90"
+                          : "border-white/5 bg-slate-950/40 opacity-60"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {/* Toggle activo */}
+                        <button
+                          type="button"
+                          onClick={() => handleTogglePairActive(pair.id)}
+                          className={`p-1 rounded cursor-pointer transition ${
+                            pair.active && isProfActive
+                              ? "bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30"
+                              : "bg-white/5 text-slate-500 hover:bg-white/10"
+                          }`}
+                          title={pair.active ? "Desactivar par" : "Activar par"}
+                        >
+                          <Check className={`h-3.5 w-3.5 ${pair.active && isProfActive ? "opacity-100" : "opacity-30"}`} />
+                        </button>
+
+                        {/* Campo Profesor ↔ Columna Asignatura */}
+                        <div className="flex items-center gap-1.5 flex-wrap min-w-0 text-xs">
+                          <span
+                            className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 font-semibold text-indigo-200 truncate max-w-[130px]"
+                            title={pair.profField}
+                          >
+                            {pair.profField}
+                          </span>
+                          <ArrowRightLeft className="h-3 w-3 text-slate-400 shrink-0" />
+                          <span
+                            className="rounded-md bg-cyan-500/20 border border-cyan-500/30 px-2 py-0.5 font-mono font-semibold text-cyan-200 truncate max-w-[130px]"
+                            title={pair.asigVectorCol}
+                          >
+                            {pair.asigVectorCol}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Botón eliminar par */}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveDistancePair(pair.id)}
+                        className="p-1 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition cursor-pointer shrink-0"
+                        title="Eliminar este par"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Agregar Nuevo Par Manual */}
+            <div className="rounded-lg border border-white/10 bg-slate-900/60 p-3 space-y-2">
+              <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Plus className="h-3.5 w-3.5 text-indigo-400" />
+                Vincular un nuevo par de distancia personalizado:
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Selector Campo Docente */}
+                <select
+                  value={newPairProfField}
+                  onChange={(e) => setNewPairProfField(e.target.value)}
+                  className="flex-1 min-w-[150px] rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-indigo-300 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="">-- Campo Profesor --</option>
+                  {activeFields.map((f) => {
+                    const cfg = queryConfigs.find((c) => c.field === f);
+                    return (
+                      <option key={f} value={f}>
+                        {cfg?.label || f}
+                      </option>
+                    );
+                  })}
+                </select>
+
+                <ArrowRightLeft className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+
+                {/* Selector Columna Vector Asignatura */}
+                <select
+                  value={newPairAsigCol}
+                  onChange={(e) => setNewPairAsigCol(e.target.value)}
+                  className="flex-1 min-w-[150px] rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1.5 text-xs text-cyan-300 font-mono font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                >
+                  <option value="">-- Vector Asignatura --</option>
+                  {availableAsigVectorCols.map((col) => (
+                    <option key={col} value={col}>
+                      {col} {col === "embedding_768" ? "(Primario)" : ""}
+                    </option>
+                  ))}
+                </select>
+
+                {/* Botón Agregar */}
+                <button
+                  type="button"
+                  onClick={handleAddDistancePair}
+                  disabled={!newPairProfField || !newPairAsigCol}
+                  className="rounded-lg bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40 transition cursor-pointer shrink-0"
+                >
+                  + Vincular Par
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* ── SECCIÓN DE CONFIGURACIÓN DE CLUSTERS Y BETAS ── */}
           <div className="rounded-xl border border-cyan-500/30 bg-slate-950/90 p-5 space-y-5 shadow-lg shadow-cyan-500/5">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
@@ -1898,7 +2269,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   </h4>
                 </div>
                 <p className="text-xs text-slate-400">
-                  Introduce los coeficientes Beta (%) que ponderan cada campo docente según el cluster al que pertenezca la asignatura.
+                  Introduce los coeficientes Beta (%) que ponderan cada par de distancia según el cluster al que pertenezca la asignatura.
                 </p>
               </div>
 
@@ -1995,16 +2366,16 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             </div>
 
             {/* Editor de Betas para la Pestaña Activa */}
-            {activeFields.length === 0 ? (
+            {activePairs.length === 0 ? (
               <div className="rounded-lg border border-white/5 bg-slate-900/40 p-4 text-center text-xs text-slate-400">
-                Activa al menos un campo en el constructor de queries arriba para configurar sus Betas.
+                Activa al menos un par de distancia en la sección superior para configurar sus Betas (&beta;).
               </div>
             ) : (
               <div className="rounded-xl border border-white/10 bg-slate-900/70 p-4 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-white">
-                      Coeficientes Beta (&beta;) para:
+                      Coeficientes Beta (&beta;) por Par para:
                     </span>
                     <span className="rounded-md bg-indigo-500/20 border border-indigo-500/30 px-2 py-0.5 text-xs font-mono font-bold text-indigo-300">
                       {selectedClusterTab === "__default__" ? "General / Sin Cluster" : selectedClusterTab}
@@ -2014,7 +2385,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   {/* Métrica de Suma Total */}
                   {(() => {
                     const currentBetas = selectedClusterTab === "__default__" ? defaultBetas : clusterBetas[selectedClusterTab] || {};
-                    const currentTotal = activeFields.reduce((acc, f) => acc + (currentBetas[f] || 0), 0);
+                    const currentTotal = activePairs.reduce((acc, p) => acc + (currentBetas[p.id] ?? currentBetas[p.profField] ?? 0), 0);
                     const isHundred = currentTotal === 100;
 
                     return (
@@ -2032,27 +2403,34 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   })()}
                 </div>
 
-                {/* Sliders de cada campo para este cluster */}
+                {/* Sliders de cada par para este cluster */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {activeFields.map((field) => {
-                    const cfg = queryConfigs.find((c) => c.field === field);
-                    const label = cfg?.label || field;
+                  {activePairs.map((pair) => {
                     const currentBetas = selectedClusterTab === "__default__" ? defaultBetas : clusterBetas[selectedClusterTab] || {};
-                    const val = typeof currentBetas[field] === "number" ? currentBetas[field] : 0;
+                    const val = typeof currentBetas[pair.id] === "number"
+                      ? currentBetas[pair.id]
+                      : typeof currentBetas[pair.profField] === "number"
+                      ? currentBetas[pair.profField]
+                      : 0;
 
                     return (
-                      <div key={field} className="rounded-lg border border-white/5 bg-slate-950/60 p-3 space-y-2">
+                      <div key={pair.id} className="rounded-lg border border-white/5 bg-slate-950/60 p-3 space-y-2">
                         <div className="flex items-center justify-between text-xs">
-                          <span className="font-semibold text-white truncate max-w-[200px]" title={label}>
-                            {label}
-                          </span>
-                          <div className="flex items-center gap-1.5 font-mono">
+                          <div className="flex flex-col min-w-0 pr-2">
+                            <span className="font-semibold text-white truncate" title={pair.label || pair.id}>
+                              {pair.label || `${pair.profField} ↔ ${pair.asigVectorCol}`}
+                            </span>
+                            <span className="text-[10px] text-slate-400 font-mono truncate">
+                              Profesor: <strong className="text-indigo-300">{pair.profField}</strong> ↔ Asignatura: <strong className="text-cyan-300">{pair.asigVectorCol}</strong>
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5 font-mono shrink-0">
                             <input
                               type="number"
                               min="0"
                               max="100"
                               value={val}
-                              onChange={(e) => handleUpdateBeta(selectedClusterTab, field, parseFloat(e.target.value) || 0)}
+                              onChange={(e) => handleUpdateBeta(selectedClusterTab, pair.id, parseFloat(e.target.value) || 0)}
                               className="w-16 rounded-md border border-white/15 bg-slate-900 px-1.5 py-0.5 text-center text-xs font-bold text-cyan-300 focus:outline-none focus:ring-1 focus:ring-cyan-500"
                             />
                             <span className="text-slate-400 text-xs">%</span>
@@ -2065,7 +2443,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                           max="100"
                           step="1"
                           value={val}
-                          onChange={(e) => handleUpdateBeta(selectedClusterTab, field, parseFloat(e.target.value))}
+                          onChange={(e) => handleUpdateBeta(selectedClusterTab, pair.id, parseFloat(e.target.value))}
                           className="w-full accent-cyan-500 cursor-pointer"
                         />
                       </div>
@@ -2090,7 +2468,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                       type="button"
                       onClick={() => handleEquiDistribute(selectedClusterTab)}
                       className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-slate-300 hover:text-white hover:bg-white/10 transition cursor-pointer"
-                      title="Distribuye porcentajes iguales entre todos los campos activos"
+                      title="Distribuye porcentajes iguales entre todos los pares activos"
                     >
                       <Sliders className="h-3.5 w-3.5" />
                       <span>Distribuir equitativamente</span>
@@ -2975,14 +3353,22 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                           <span className="text-[9px] text-purple-200/80 font-normal">(Exento de cupo Top K)</span>
                                         </span>
                                       )}
-                                      {matchItem.embedding_768 && (
+                                      {matchItem.vectors && Object.keys(matchItem.vectors).length > 1 ? (
+                                        <span
+                                          className="hidden sm:inline-flex items-center gap-1 rounded-md bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.5 text-[10px] text-cyan-200 font-mono font-semibold"
+                                          title={`Vectores disponibles: ${Object.keys(matchItem.vectors).join(", ")}`}
+                                        >
+                                          <Cpu className="h-2.5 w-2.5 text-cyan-400" />
+                                          <span>{Object.keys(matchItem.vectors).length} Vectores</span>
+                                        </span>
+                                      ) : matchItem.embedding_768 ? (
                                         <span
                                           className="hidden sm:inline-flex items-center gap-1 rounded-md bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300 font-mono"
                                           title="Vector 768d disponible y descargable"
                                         >
                                           Vector 768d
                                         </span>
-                                      )}
+                                      ) : null}
                                     </div>
 
                                     {/* Medidor de Similitud Compuesta */}
@@ -2999,22 +3385,41 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                     </div>
                                   </div>
 
-                                  {/* Desglose por Criterio Ponderado */}
+                                  {/* Desglose por Pares de Distancia Multi-Vector o Criterios */}
                                   <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-white/5">
-                                    <span className="text-[10px] text-slate-400">Desglose:</span>
-                                    {Object.entries(matchItem.fieldSimilarities).map(
-                                      ([field, score]) => (
-                                        <span
-                                          key={field}
-                                          className="inline-flex items-center gap-1 rounded-md bg-white/5 border border-white/10 px-2 py-0.5 text-[10px] text-slate-300"
-                                        >
-                                          <span className="text-slate-400">{field}:</span>
-                                          <strong className="text-indigo-300 font-mono">
-                                            {(score * 100).toFixed(1)}%
-                                          </strong>
-                                        </span>
-                                      )
-                                    )}
+                                    <span className="text-[10px] text-slate-400">
+                                      {matchItem.pairSimilarities && Object.keys(matchItem.pairSimilarities).length > 0
+                                        ? "Pares de Distancia:"
+                                        : "Desglose:"}
+                                    </span>
+                                    {matchItem.pairSimilarities && Object.keys(matchItem.pairSimilarities).length > 0
+                                      ? Object.entries(matchItem.pairSimilarities).map(([pairKey, score]) => {
+                                          const pairCfg = distancePairs.find((p) => p.id === pairKey);
+                                          const label = pairCfg?.label || pairKey;
+                                          return (
+                                            <span
+                                              key={pairKey}
+                                              className="inline-flex items-center gap-1 rounded-md bg-indigo-500/10 border border-indigo-500/25 px-2 py-0.5 text-[10px] text-slate-300"
+                                              title={`Par: ${pairKey}`}
+                                            >
+                                              <span className="text-indigo-300 font-medium">{label}:</span>
+                                              <strong className="text-cyan-300 font-mono">
+                                                {(score * 100).toFixed(1)}%
+                                              </strong>
+                                            </span>
+                                          );
+                                        })
+                                      : Object.entries(matchItem.fieldSimilarities).map(([field, score]) => (
+                                          <span
+                                            key={field}
+                                            className="inline-flex items-center gap-1 rounded-md bg-white/5 border border-white/10 px-2 py-0.5 text-[10px] text-slate-300"
+                                          >
+                                            <span className="text-slate-400">{field}:</span>
+                                            <strong className="text-indigo-300 font-mono">
+                                              {(score * 100).toFixed(1)}%
+                                            </strong>
+                                          </span>
+                                        ))}
                                   </div>
 
                                   {/* Extracto de Contenido Temático */}

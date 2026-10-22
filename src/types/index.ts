@@ -14,6 +14,7 @@ export interface Asignatura {
   match_semantico?: boolean;
   dot_product_match?: number | null;
   embedding_768?: number[] | null;
+  vectors?: Record<string, number[]> | null;
   created_at?: string;
   [key: string]: unknown;
 }
@@ -36,7 +37,8 @@ export interface ColumnMapping {
   contenido_tematico: string;
   actividades_de_aprendizaje: string;
   embedding_768: string;
-  [key: string]: string | undefined;
+  vectorColumns?: string[];
+  [key: string]: string | string[] | undefined;
 }
 
 export interface Profesor {
@@ -58,6 +60,18 @@ export interface QueryConfig {
   embeddingColumn?: string; // Columna en el archivo de profesores con el vector precalculado
 }
 
+/**
+ * Configuración de un par de distancia entre un campo del profesor y una columna de vector de la asignatura
+ */
+export interface DistancePairConfig {
+  id: string;              // Identificador único (ej: "trayectoria_academica__vector_temario")
+  profField: string;       // Campo de profesor (ej: "trayectoria_academica")
+  asigVectorCol: string;   // Columna de vector de asignatura (ej: "vector_temario" o "embedding_768")
+  label?: string;          // Etiqueta legible (ej: "Trayectoria Académica ↔ Vector Temario")
+  active: boolean;         // Si el par está activo para el matching
+  weight: number;          // Peso base o inicial (0-100)
+}
+
 export interface RegexFilterConfig {
   enabled: boolean;
   regexCredencial: string;
@@ -69,8 +83,8 @@ export interface RegexFilterConfig {
 export interface ClusterBetasConfig {
   clusterColumn: string; // Columna de cluster en asignaturas (default: 'cluster')
   clusters: string[];    // Lista de clusters únicos detectados
-  betas: Record<string, Record<string, number>>; // clusterName -> { fieldName: weightInPercent }
-  defaultBetas: Record<string, number>;          // { fieldName: weightInPercent } para asignaturas sin cluster
+  betas: Record<string, Record<string, number>>; // clusterName -> { pairIdOrFieldName: weightInPercent }
+  defaultBetas: Record<string, number>;          // { pairIdOrFieldName: weightInPercent } para asignaturas sin cluster
 }
 
 export type ProfessorImportMode = "generate" | "only_match";
@@ -83,8 +97,10 @@ export interface MatchResultItem {
   contenido_tematico: string;
   compositeSimilarity: number;
   fieldSimilarities: Record<string, number>;
+  pairSimilarities?: Record<string, number>;
   match_nombre?: boolean;
   embedding_768?: number[] | null;
+  vectors?: Record<string, number[]> | null;
 }
 
 export interface ProfesorMatchResult {
@@ -130,6 +146,8 @@ export interface FilteredAsignatura {
   contenido_tematico?: string | null;
   match_nombre?: boolean;
   hasEmbedding?: boolean;
+  vectors?: Record<string, number[]> | null;
+  vectorColumns?: string[];
 }
 
 export interface FilterClavesResponse {

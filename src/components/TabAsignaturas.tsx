@@ -18,6 +18,7 @@ import {
   Check,
   ChevronDown,
   Info,
+  X,
 } from "lucide-react";
 import { Asignatura, ColumnMapping } from "@/types";
 import {
@@ -51,7 +52,12 @@ export default function TabAsignaturas({
     contenido_tematico: "",
     actividades_de_aprendizaje: "",
     embedding_768: "",
+    vectorColumns: [],
   });
+
+  // Multi-Vector: Columnas vectoriales seleccionadas y vector principal
+  const [selectedVectorColumns, setSelectedVectorColumns] = useState<string[]>([]);
+  const [primaryVectorColumn, setPrimaryVectorColumn] = useState<string>("");
 
   // Opciones de Carga
   const [upsertMode, setUpsertMode] = useState<"upsert" | "insert">("insert");
@@ -76,6 +82,7 @@ export default function TabAsignaturas({
       cluster?: string | null;
       contenido_tematico: string | null;
       hasEmbedding: boolean;
+      vectorColumns?: string[];
       created_at: string;
     }>
   >([]);
@@ -97,6 +104,7 @@ export default function TabAsignaturas({
         totalCount: number;
         withEmbeddingCount: number;
         withoutEmbeddingCount: number;
+        availableVectorColumns?: string[];
         records: any[];
         error?: string;
       }>(`/api/asignaturas?q=${encodeURIComponent(searchQuery)}&filter=${filterType}&limit=50`);
@@ -122,8 +130,8 @@ export default function TabAsignaturas({
     loadDatabaseRecords();
   }, [loadDatabaseRecords]);
 
-  // ── Auto-Detección Inteligente de Columnas ──
-  const detectColumns = (headers: string[]): ColumnMapping => {
+  // ── Auto-Detección Inteligente de Columnas (con soporte Multi-Vector) ──
+  const detectColumns = (headers: string[], firstRow?: Record<string, string>): { mapping: ColumnMapping; vectorCols: string[]; primaryVec: string } => {
     const normalize = (s: string) =>
       s
         .toLowerCase()
@@ -139,23 +147,42 @@ export default function TabAsignaturas({
       return "";
     };
 
-    return {
+    // Detectar todas las columnas que son vectores
+    const detectedVecCols: string[] = [];
+    headers.forEach((h) => {
+      const norm = normalize(h);
+      const isVectorName =
+        norm.includes("embedding") ||
+        norm.includes("vector") ||
+        norm.includes("representation") ||
+        norm.includes("representacion") ||
+        norm.startsWith("emb");
+
+      if (isVectorName) {
+        detectedVecCols.push(h);
+      } else if (firstRow && firstRow[h]) {
+        const sample = parseEmbeddingValue(firstRow[h]);
+        if (sample && sample.length === 768) {
+          detectedVecCols.push(h);
+        }
+      }
+    });
+
+    // Vector principal
+    const primaryCandidate =
+      detectedVecCols.find((c) => {
+        const norm = normalize(c);
+        return norm === "embedding768" || norm === "embedding_768" || norm === "vector768" || norm === "vector_768";
+      }) ||
+      detectedVecCols[0] ||
+      findMatch(["embedding768", "embedding_768", "embeddings", "embedding", "vector768", "vector_768", "vector"]);
+
+    const newMapping: ColumnMapping = {
       nombre: findMatch(["nombre", "asignatura", "materia", "unidad", "curso", "title"]),
       clave: findMatch(["clave", "codigo", "code", "id", "cod"]),
       cluster: findMatch(["cluster", "area", "grupo", "departamento", "bloque", "categoria"]),
-      embedding_768: findMatch([
-        "embedding768",
-        "embedding_768",
-        "embeddings",
-        "embedding",
-        "vector768",
-        "vector_768",
-        "vector",
-        "vectores",
-        "emb",
-        "representation",
-        "representacion",
-      ]),
+      embedding_768: primaryCandidate,
+      vectorColumns: detectedVecCols,
       fines_de_aprendizaje_o_formacion: findMatch([
         "fines",
         "objetivo",
@@ -178,6 +205,12 @@ export default function TabAsignaturas({
         "metodologia",
       ]),
     };
+
+    return {
+      mapping: newMapping,
+      vectorCols: detectedVecCols,
+      primaryVec: primaryCandidate,
+    };
   };
 
   // ── Manejo de Archivo ──
@@ -189,8 +222,10 @@ export default function TabAsignaturas({
       const { headers, rows } = await parseSpreadsheetFile(selectedFile);
       setFileHeaders(headers);
       setFileRows(rows);
-      const autoMapping = detectColumns(headers);
+      const { mapping: autoMapping, vectorCols, primaryVec } = detectColumns(headers, rows[0]);
       setMapping(autoMapping);
+      setSelectedVectorColumns(vectorCols);
+      setPrimaryVectorColumn(primaryVec);
     } catch (err: any) {
       alert(err.message || "Error al procesar el archivo");
       setFile(null);
@@ -264,19 +299,29 @@ export default function TabAsignaturas({
           rowData.actividades_de_aprendizaje = row[mapping.actividades_de_aprendizaje].trim();
         }
 
-        // Parsear embedding de la columna seleccionada
-        if (mapping.embedding_768 && row[mapping.embedding_768]) {
-          const parsedEmb = parseEmbeddingValue(row[mapping.embedding_768]);
-          if (parsedEmb) {
-            rowData.embedding_768 = parsedEmb;
-            parsedEmbeddingsCount++;
-          } else {
-            invalidEmbeddingsCount++;
+        // Parsear embeddings de todas las columnas vectoriales seleccionadas (Multi-Vector)
+        const rowVectors: Record<string, number[]> = {};
+        selectedVectorColumns.forEach((colName) => {
+          if (row[colName]) {
+            const parsed = parseEmbeddingValue(row[colName]);
+            if (parsed && parsed.length === 768) {
+              rowVectors[colName] = parsed;
+              parsedEmbeddingsCount++;
+            } else if (parsed) {
+              invalidEmbeddingsCount++;
+            }
           }
+        });
 
-          // Si el header del archivo no se llamaba 'embedding_768', remover el valor string original
-          if (mapping.embedding_768 !== "embedding_768") {
-            delete rowData[mapping.embedding_768];
+        if (Object.keys(rowVectors).length > 0) {
+          rowData.vectors = rowVectors;
+          // Vector principal asignado a embedding_768
+          const primaryVec =
+            rowVectors[primaryVectorColumn] ||
+            (mapping.embedding_768 && rowVectors[mapping.embedding_768]) ||
+            Object.values(rowVectors)[0];
+          if (primaryVec) {
+            rowData.embedding_768 = primaryVec;
           }
         }
 
@@ -289,7 +334,7 @@ export default function TabAsignaturas({
 
       // Guardar directamente en Supabase vía /api/asignaturas en lotes de 50
       setStatusMessage(
-        `Guardando ${validRows.length} registros en Supabase (${parsedEmbeddingsCount} con vector)...`
+        `Guardando ${validRows.length} registros en Supabase (${parsedEmbeddingsCount} vectores procesados)...`
       );
       setUploadProgress(25);
 
@@ -324,18 +369,18 @@ export default function TabAsignaturas({
       setStatusMessage("¡Carga completada exitosamente!");
 
       const observations: string[] = [...discardedRows];
-      if (mapping.embedding_768) {
+      if (selectedVectorColumns.length > 0) {
         if (invalidEmbeddingsCount > 0) {
           observations.push(
-            `Aviso: En ${invalidEmbeddingsCount} filas no se pudo parsear el vector de la columna '${mapping.embedding_768}'.`
+            `Aviso: En ${invalidEmbeddingsCount} celdas no se pudo parsear el vector de 768 dimensiones.`
           );
         }
         observations.push(
-          `Embeddings leídos del CSV: ${parsedEmbeddingsCount} de ${validRows.length} asignaturas guardadas.`
+          `Embeddings Multi-Vector: Se procesaron ${selectedVectorColumns.length} columnas vectoriales (${selectedVectorColumns.join(", ")}). Vector principal: '${primaryVectorColumn || selectedVectorColumns[0]}'.`
         );
       } else {
         observations.push(
-          "No se asignó columna de embeddings. Las asignaturas se guardaron sin vector."
+          "No se asignó ninguna columna de embeddings. Las asignaturas se guardaron sin vector."
         );
       }
 
@@ -379,25 +424,67 @@ export default function TabAsignaturas({
     }
   };
 
-  // Inspección de la columna de embeddings seleccionada para feedback en tiempo real
-  const embeddingSample = React.useMemo(() => {
-    if (!mapping.embedding_768 || fileRows.length === 0) return null;
-    const rawVal = fileRows[0][mapping.embedding_768];
-    if (!rawVal) return { status: "empty", length: 0, preview: "" };
-    const parsed = parseEmbeddingValue(rawVal);
-    if (!parsed) {
-      return {
-        status: "invalid",
-        length: 0,
-        preview: String(rawVal).slice(0, 80),
+  // Inspección de las columnas vectoriales seleccionadas para feedback en tiempo real
+  const vectorSamples = React.useMemo(() => {
+    if (fileRows.length === 0 || selectedVectorColumns.length === 0) return {};
+    const res: Record<string, { status: "empty" | "invalid" | "valid_768" | "valid_other"; length: number; preview: string }> = {};
+    const sampleRow = fileRows[0];
+    selectedVectorColumns.forEach((col) => {
+      const rawVal = sampleRow[col];
+      if (!rawVal) {
+        res[col] = { status: "empty", length: 0, preview: "" };
+        return;
+      }
+      const parsed = parseEmbeddingValue(rawVal);
+      if (!parsed) {
+        res[col] = {
+          status: "invalid",
+          length: 0,
+          preview: String(rawVal).slice(0, 80),
+        };
+        return;
+      }
+      res[col] = {
+        status: parsed.length === 768 ? "valid_768" : "valid_other",
+        length: parsed.length,
+        preview: `[${parsed.slice(0, 3).map((n) => n.toFixed(4)).join(", ")}... +${parsed.length - 3} floats]`,
       };
+    });
+    return res;
+  }, [selectedVectorColumns, fileRows]);
+
+  const toggleVectorColumn = (colName: string) => {
+    setSelectedVectorColumns((prev) => {
+      if (prev.includes(colName)) {
+        const next = prev.filter((c) => c !== colName);
+        if (primaryVectorColumn === colName) {
+          const newPrimary = next[0] || "";
+          setPrimaryVectorColumn(newPrimary);
+          setMapping((m) => ({ ...m, embedding_768: newPrimary, vectorColumns: next }));
+        } else {
+          setMapping((m) => ({ ...m, vectorColumns: next }));
+        }
+        return next;
+      } else {
+        const next = [...prev, colName];
+        if (!primaryVectorColumn) {
+          setPrimaryVectorColumn(colName);
+          setMapping((m) => ({ ...m, embedding_768: colName, vectorColumns: next }));
+        } else {
+          setMapping((m) => ({ ...m, vectorColumns: next }));
+        }
+        return next;
+      }
+    });
+  };
+
+  const handleSetPrimaryVector = (colName: string) => {
+    setPrimaryVectorColumn(colName);
+    setMapping((prev) => ({ ...prev, embedding_768: colName }));
+    if (!selectedVectorColumns.includes(colName)) {
+      setSelectedVectorColumns((prev) => [...prev, colName]);
     }
-    return {
-      status: parsed.length === 768 ? "valid_768" : "valid_other",
-      length: parsed.length,
-      preview: `[${parsed.slice(0, 3).map((n) => n.toFixed(4)).join(", ")}... +${parsed.length - 3} floats]`,
-    };
-  }, [mapping.embedding_768, fileRows]);
+  };
 
   // Columnas esperadas en Supabase con sus etiquetas y descripciones
   const targetFields: Array<{
@@ -543,7 +630,7 @@ export default function TabAsignaturas({
         ) : (
           /* Mapeador de Columnas Interactivo */
           <div className="space-y-6">
-            {/* 1. SELECCIÓN DESTACADA DE LA COLUMNA DE EMBEDDINGS */}
+            {/* 1. SELECCIÓN DESTACADA MULTI-VECTOR */}
             <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-5 space-y-4 shadow-lg shadow-purple-950/20">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2.5">
@@ -552,135 +639,157 @@ export default function TabAsignaturas({
                   </div>
                   <div>
                     <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      Columna de Embeddings / Vector (768d)
+                      Columnas de Embeddings / Multi-Vector (768d)
                       <span className="text-[10px] rounded-full bg-purple-500/30 px-2 py-0.5 text-purple-200 border border-purple-400/30 font-semibold">
-                        Requerida para matching
+                        Soporte Multi-Vector
                       </span>
                     </h3>
                     <p className="text-xs text-purple-200/70">
-                      Selecciona cuál de las columnas del CSV contiene los vectores precalculados.
+                      Selecciona una o más columnas del archivo que contengan vectores precalculados (ej. temario, objetivos, actividades).
                     </p>
                   </div>
                 </div>
 
-                {mapping.embedding_768 && (
+                <div className="flex items-center gap-2">
                   <span className="rounded-lg bg-purple-500/20 border border-purple-500/40 text-purple-200 text-xs px-2.5 py-1 font-mono font-semibold">
-                    Columna activa: {mapping.embedding_768}
+                    {selectedVectorColumns.length} columna{selectedVectorColumns.length === 1 ? "" : "s"} seleccionada{selectedVectorColumns.length === 1 ? "" : "s"}
                   </span>
-                )}
-              </div>
-
-              {/* Selector principal de la columna de embedding */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-slate-300">
-                    Columna con los embeddings del CSV:
-                  </label>
-                  <select
-                    value={mapping.embedding_768 || ""}
-                    onChange={(e) =>
-                      setMapping((prev) => ({ ...prev, embedding_768: e.target.value }))
-                    }
-                    className="w-full rounded-xl border border-purple-400/30 bg-slate-950 px-3.5 py-2.5 text-xs text-white focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 font-medium"
-                  >
-                    <option value="">-- Seleccionar columna de embeddings (o ninguna) --</option>
-                    {fileHeaders.map((header) => (
-                      <option key={header} value={header}>
-                        {header}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Panel de validación visual del vector */}
-                <div>
-                  {embeddingSample ? (
-                    <div className="space-y-1.5 pt-1">
-                      {embeddingSample.status === "valid_768" && (
-                        <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-300 font-medium">
-                          <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
-                          <div>
-                            <p className="font-bold">¡Vector compatible detectado!</p>
-                            <p className="text-[11px] text-emerald-400/80">
-                              768 dimensiones numéricas confirmadas en la muestra de la primera fila.
-                            </p>
-                          </div>
-                        </div>
-                      )}
-                      {embeddingSample.status === "valid_other" && (
-                        <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300 font-medium">
-                          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-                          <div>
-                            <p className="font-bold">{embeddingSample.length} dimensiones detectadas</p>
-                            <p className="text-[11px] text-amber-400/80">
-                              Supabase espera un vector de 768 dimensiones.
-                            </p>
-                          </div>
-                        </div>
-                      )}
-                      {embeddingSample.status === "invalid" && (
-                        <div className="flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300 font-medium">
-                          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-                          <div>
-                            <p className="font-bold">Formato de vector no reconocido</p>
-                            <p className="text-[11px] text-rose-400/80">
-                              No se pudieron extraer números flotantes de la celda de muestra.
-                            </p>
-                          </div>
-                        </div>
-                      )}
-                      {embeddingSample.preview && (
-                        <p className="text-[10px] text-slate-400 truncate font-mono bg-white/5 p-2 rounded-lg border border-white/5">
-                          <span className="text-slate-500 font-sans">Muestra fila 1:</span> {embeddingSample.preview}
-                        </p>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="rounded-xl border border-white/10 bg-slate-900/60 p-3 text-xs text-slate-400">
-                      <p className="text-slate-300 font-medium">Ninguna columna seleccionada como vector</p>
-                      <p className="text-[11px] mt-0.5">
-                        Si tu CSV no contiene embeddings, las asignaturas se cargarán como texto plano.
-                      </p>
-                    </div>
-                  )}
                 </div>
               </div>
 
-              {/* Badges para seleccionar columna de vector con un clic */}
-              <div className="pt-2 border-t border-purple-500/20 space-y-1.5">
-                <span className="text-[11px] font-medium text-purple-200/80">
-                  Haz clic en cualquier columna del archivo para asignarla como vector:
-                </span>
+              {/* Botones rápidos de selección para cada columna */}
+              <div className="pt-2 border-t border-purple-500/20 space-y-2">
+                <div className="text-[11px] font-medium text-purple-200/90 flex flex-wrap items-center justify-between gap-2">
+                  <span>Haz clic en las columnas del archivo para marcarlas como vectoriales:</span>
+                  <span className="text-[10px] text-amber-300 font-sans">★ = Vector principal (embedding_768)</span>
+                </div>
                 <div className="flex flex-wrap gap-1.5">
                   {fileHeaders.map((header) => {
-                    const isEmbedding = header === mapping.embedding_768;
+                    const isSelected = selectedVectorColumns.includes(header);
+                    const isPrimary = header === primaryVectorColumn;
+                    const sample = vectorSamples[header];
+                    const is768 = sample?.status === "valid_768";
+
                     return (
                       <button
                         key={header}
                         type="button"
-                        onClick={() => {
-                          setMapping((prev) => ({
-                            ...prev,
-                            embedding_768: prev.embedding_768 === header ? "" : header,
-                          }));
-                        }}
-                        className={`rounded-lg px-2.5 py-1 text-xs font-mono border transition flex items-center gap-1.5 ${
-                          isEmbedding
-                            ? "border-purple-400 bg-purple-500/30 text-white font-bold shadow-md shadow-purple-500/30 ring-1 ring-purple-400"
+                        onClick={() => toggleVectorColumn(header)}
+                        className={`rounded-lg px-2.5 py-1.5 text-xs font-mono border transition flex items-center gap-1.5 cursor-pointer ${
+                          isPrimary
+                            ? "border-purple-400 bg-purple-600/40 text-white font-bold shadow-md shadow-purple-500/40 ring-2 ring-purple-400/60"
+                            : isSelected
+                            ? "border-purple-400/70 bg-purple-500/25 text-purple-200 font-semibold"
                             : "border-white/10 bg-white/5 text-slate-300 hover:border-purple-500/40 hover:text-white"
                         }`}
                       >
                         <span>{header}</span>
-                        {isEmbedding && (
+                        {isPrimary ? (
+                          <span className="rounded bg-amber-400/20 text-amber-300 text-[10px] px-1 font-sans font-bold flex items-center gap-0.5">
+                            ★ Principal
+                          </span>
+                        ) : isSelected ? (
                           <span className="rounded bg-purple-400/30 text-purple-200 text-[10px] px-1 font-sans">
                             Vector ✓
                           </span>
-                        )}
+                        ) : null}
                       </button>
                     );
                   })}
                 </div>
               </div>
+
+              {/* Tarjetas de validación de cada columna vectorial activa */}
+              {selectedVectorColumns.length > 0 ? (
+                <div className="pt-2 border-t border-purple-500/20 space-y-2.5">
+                  <span className="text-[11px] font-semibold text-slate-300">
+                    Vectores activos configurados para Supabase ({selectedVectorColumns.length}):
+                  </span>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {selectedVectorColumns.map((colName) => {
+                      const sample = vectorSamples[colName];
+                      const isPrimary = colName === primaryVectorColumn;
+
+                      return (
+                        <div
+                          key={colName}
+                          className={`rounded-xl border p-3 space-y-2 transition ${
+                            isPrimary
+                              ? "border-purple-400/60 bg-purple-950/40 ring-1 ring-purple-400/30"
+                              : "border-white/10 bg-slate-950/60"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-xs font-bold text-white flex items-center gap-1.5 truncate">
+                              <Sparkles className="h-3.5 w-3.5 text-purple-400 flex-shrink-0" />
+                              {colName}
+                            </span>
+                            <div className="flex items-center gap-1.5">
+                              {isPrimary ? (
+                                <span className="rounded-full bg-amber-500/20 border border-amber-500/40 px-2 py-0.5 text-[10px] font-bold text-amber-300">
+                                  ★ Vector Principal
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSetPrimaryVector(colName)}
+                                  className="text-[10px] text-purple-300 hover:text-white underline cursor-pointer"
+                                >
+                                  Hacer principal
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => toggleVectorColumn(colName)}
+                                className="text-slate-400 hover:text-rose-300 p-0.5"
+                                title="Desmarcar columna como vector"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Estado de muestra */}
+                          {sample && (
+                            <div className="text-[11px]">
+                              {sample.status === "valid_768" && (
+                                <div className="flex items-center gap-1.5 text-emerald-300">
+                                  <CheckCircle2 className="h-3.5 w-3.5 flex-shrink-0" />
+                                  <span>768 dimensiones numéricas confirmadas en fila 1</span>
+                                </div>
+                              )}
+                              {sample.status === "valid_other" && (
+                                <div className="flex items-center gap-1.5 text-amber-300">
+                                  <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                                  <span>{sample.length} dimensiones detectadas (se esperan 768)</span>
+                                </div>
+                              )}
+                              {sample.status === "invalid" && (
+                                <div className="flex items-center gap-1.5 text-rose-300">
+                                  <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                                  <span>Valores flotantes no reconocidos</span>
+                                </div>
+                              )}
+                              {sample.preview && (
+                                <p className="mt-1 text-[10px] text-slate-400 font-mono truncate bg-black/30 p-1.5 rounded border border-white/5">
+                                  {sample.preview}
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-white/10 bg-slate-900/60 p-3 text-xs text-slate-400">
+                  <p className="text-slate-300 font-medium">Ninguna columna seleccionada como vector</p>
+                  <p className="text-[11px] mt-0.5">
+                    Haz clic en los botones de arriba para marcar una o más columnas del archivo como vectores.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* 2. TODAS LAS COLUMNAS A SUBIR POR DEFECTO */}
@@ -703,18 +812,22 @@ export default function TabAsignaturas({
 
               <div className="flex flex-wrap gap-1.5">
                 {fileHeaders.map((header) => {
-                  const isEmbedding = header === mapping.embedding_768;
+                  const isSelectedVector = selectedVectorColumns.includes(header);
+                  const isPrimary = header === primaryVectorColumn;
+
                   return (
                     <span
                       key={header}
                       className={`rounded-lg px-2.5 py-1 text-xs font-mono border ${
-                        isEmbedding
-                          ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-bold"
+                        isPrimary
+                          ? "border-amber-400/60 bg-amber-500/20 text-amber-200 font-bold"
+                          : isSelectedVector
+                          ? "border-purple-500/60 bg-purple-500/25 text-purple-200 font-semibold"
                           : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 font-medium"
                       }`}
                     >
                       {header}
-                      {isEmbedding && " (Vector 768d)"}
+                      {isPrimary ? " (Vector Principal 768d)" : isSelectedVector ? " (Vector 768d)" : ""}
                     </span>
                   );
                 })}
@@ -763,23 +876,30 @@ export default function TabAsignaturas({
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-900 text-slate-400 uppercase text-[10px] tracking-wider">
                     <tr>
-                      {fileHeaders.slice(0, 6).map((h) => (
-                        <th key={h} className="px-3 py-2">
-                          {h}
-                          {h === mapping.embedding_768 && (
-                            <span className="ml-1 text-purple-300 font-bold">(Vector)</span>
-                          )}
-                        </th>
-                      ))}
+                      {fileHeaders.slice(0, 8).map((h) => {
+                        const isPrimary = h === primaryVectorColumn;
+                        const isVector = selectedVectorColumns.includes(h);
+
+                        return (
+                          <th key={h} className="px-3 py-2">
+                            {h}
+                            {isPrimary ? (
+                              <span className="ml-1 text-amber-300 font-bold">(Vector Principal)</span>
+                            ) : isVector ? (
+                              <span className="ml-1 text-purple-300 font-bold">(Vector)</span>
+                            ) : null}
+                          </th>
+                        );
+                      })}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5 text-slate-300">
                     {fileRows.slice(0, 4).map((row, idx) => (
                       <tr key={idx} className="hover:bg-white/[0.02]">
-                        {fileHeaders.slice(0, 6).map((h) => {
+                        {fileHeaders.slice(0, 8).map((h) => {
                           const val = row[h];
-                          const isEmbedding = h === mapping.embedding_768;
-                          if (isEmbedding) {
+                          const isVector = selectedVectorColumns.includes(h);
+                          if (isVector) {
                             const parsed = val ? parseEmbeddingValue(val) : null;
                             return (
                               <td key={h} className="px-3 py-2 font-mono text-xs">
@@ -814,12 +934,12 @@ export default function TabAsignaturas({
               <div className="space-y-1">
                 <div className="flex items-center gap-2 text-xs font-semibold text-white">
                   <Database className="h-4 w-4 text-indigo-400" />
-                  <span>Carga directa de catálogo con embeddings</span>
+                  <span>Carga directa de catálogo con soporte Multi-Vector</span>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  {mapping.embedding_768
-                    ? `Los embeddings se leerán directamente de la columna '${mapping.embedding_768}' del archivo.`
-                    : "No se seleccionó columna de embeddings. Las materias se guardarán sin vector."}
+                  {selectedVectorColumns.length > 0
+                    ? `Se guardarán ${selectedVectorColumns.length} columnas de vectores (${selectedVectorColumns.join(", ")}). Vector principal: '${primaryVectorColumn || selectedVectorColumns[0]}'.`
+                    : "No se seleccionó ninguna columna de embeddings. Las materias se guardarán sin vector."}
                 </p>
               </div>
 
@@ -1058,10 +1178,22 @@ export default function TabAsignaturas({
                       </td>
                       <td className="px-4 py-3 text-center">
                         {item.hasEmbedding ? (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
-                            <Sparkles className="h-2.5 w-2.5" />
-                            768d ✓
-                          </span>
+                          <div className="inline-flex flex-col items-center gap-1">
+                            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                              <Sparkles className="h-2.5 w-2.5" />
+                              {item.vectorColumns && item.vectorColumns.length > 1
+                                ? `${item.vectorColumns.length} vectores ✓`
+                                : "768d ✓"}
+                            </span>
+                            {item.vectorColumns && item.vectorColumns.length > 1 && (
+                              <span
+                                className="text-[9px] text-slate-400 font-mono truncate max-w-[150px]"
+                                title={item.vectorColumns.join(", ")}
+                              >
+                                {item.vectorColumns.join(", ")}
+                              </span>
+                            )}
+                          </div>
                         ) : (
                           <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
                             Sin vector
