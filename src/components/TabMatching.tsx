@@ -69,6 +69,94 @@ import {
   cleanClave,
 } from "@/lib/utils";
 
+// ── Helpers para Detección Inteligente de Columnas del Docente ──
+const normalizeHeader = (s: string): string =>
+  (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const cleanHeaderToken = (s: string): string =>
+  normalizeHeader(s).replace(/[^a-z0-9]/g, "");
+
+const isIdHeader = (h: string): boolean => {
+  if (!h) return false;
+  const n = normalizeHeader(h).trim();
+  const c = cleanHeaderToken(h);
+
+  if (["id", "cve", "clave", "codigo", "matricula", "expediente", "nomina", "rfc", "curp"].includes(c)) {
+    return true;
+  }
+  if (
+    c.startsWith("idprofesor") ||
+    c.startsWith("iddocente") ||
+    c.startsWith("idmaestro") ||
+    c.startsWith("idempleado") ||
+    c.startsWith("idpersona") ||
+    c.endsWith("idprofesor") ||
+    c.endsWith("iddocente") ||
+    c === "id"
+  ) {
+    return true;
+  }
+  if (/^id[\s_.:-]/i.test(n) || /[\s_.:-]id$/i.test(n) || /\bid\b/i.test(n)) {
+    return true;
+  }
+  if (
+    n.includes("identificador") ||
+    n.includes("matricula") ||
+    n.includes("codigo profesor") ||
+    n.includes("codigo docente") ||
+    n.includes("clave profesor") ||
+    n.includes("clave docente") ||
+    n.includes("num empleado") ||
+    n.includes("numero empleado") ||
+    n.includes("num_empleado") ||
+    n.includes("nomina")
+  ) {
+    return true;
+  }
+  return false;
+};
+
+const isVectorHeader = (h: string): boolean => {
+  if (!h) return false;
+  const n = normalizeHeader(h);
+  return n.includes("embedding") || n.includes("vector");
+};
+
+const isNameHeader = (h: string): boolean => {
+  if (!h) return false;
+  if (isIdHeader(h) || isVectorHeader(h)) return false;
+  const n = normalizeHeader(h);
+  if (
+    n.includes("correo") ||
+    n.includes("email") ||
+    n.includes("telefono") ||
+    n.includes("perfil") ||
+    n.includes("trayectoria") ||
+    n.includes("experiencia") ||
+    n.includes("cv") ||
+    n.includes("antiguedad") ||
+    n.includes("departamento") ||
+    n.includes("campus") ||
+    n.includes("facultad") ||
+    n.includes("escuela") ||
+    n.includes("categoria") ||
+    n.includes("puesto")
+  ) {
+    return false;
+  }
+  return (
+    n.includes("nombre") ||
+    n.includes("docente") ||
+    n.includes("profesor") ||
+    n.includes("maestro") ||
+    n.includes("catedratico") ||
+    n.includes("persona")
+  );
+};
+
 interface TabMatchingProps {
   onOpenSqlModal: () => void;
 }
@@ -119,6 +207,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
   // Columna que identifica el nombre del profesor
   const [nameColumn, setNameColumn] = useState<string>("");
+  // Columna que identifica el ID del profesor (opcional, autogenerado si no existe)
+  const [idColumn, setIdColumn] = useState<string>("");
 
   // Configurador Dinámico de Queries y Pesos
   const [queryConfigs, setQueryConfigs] = useState<QueryConfig[]>([]);
@@ -730,7 +820,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   };
 
   // ── Inicializar Configuraciones de Query al Cargar Archivo ──
-  const setupQueryConfigs = (headers: string[], detectedNameCol: string) => {
+  const setupQueryConfigs = (headers: string[], detectedNameCol: string, detectedIdCol?: string) => {
     const configs: QueryConfig[] = [];
 
     const normalize = (s: string) =>
@@ -741,6 +831,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
     headers.forEach((header) => {
       if (header === detectedNameCol) return;
+      if (detectedIdCol && header === detectedIdCol) return;
+      if (isIdHeader(header)) return;
 
       const norm = normalize(header);
 
@@ -775,21 +867,21 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       }
 
       // Auto-detectar si existe una columna de embedding en el archivo para este campo
+      const cleanH = cleanHeaderToken(header);
       const matchingEmbCol =
         headers.find((h) => {
-          const hn = normalize(h);
+          const ch = cleanHeaderToken(h);
           return (
-            hn === `embeddingprofesor(${norm})` ||
-            hn === `embeddingprofesor${norm}` ||
-            hn === `embedding${norm}` ||
-            hn === `vector${norm}` ||
-            hn === `${norm}embedding` ||
-            hn === `${norm}vector`
+            ch === `embeddingprofesor${cleanH}` ||
+            ch === `embedding${cleanH}` ||
+            ch === `vector${cleanH}` ||
+            ch === `${cleanH}embedding` ||
+            ch === `${cleanH}vector`
           );
         }) ||
         headers.find((h) => {
-          const hn = normalize(h);
-          return hn === "embeddingprofesor" || hn === "embedding768" || hn === "vector";
+          const ch = cleanHeaderToken(h);
+          return ch === "embeddingprofesor" || ch === "embedding768" || ch === "vector";
         }) ||
         "";
 
@@ -816,26 +908,20 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       setFileHeaders(headers);
       setFileRows(rows);
 
-      // Detectar columna de nombre
-      const normalize = (s: string) =>
-        s
-          .toLowerCase()
-          .normalize("NFD")
-          .replace(/[\u0300-\u036f]/g, "");
+      // Detectar columna de ID
+      const detectedId = headers.find((h) => isIdHeader(h)) || "";
+      setIdColumn(detectedId);
 
-      const detected =
-        headers.find((h) => {
-          const n = normalize(h);
-          return (
-            n.includes("profesor") ||
-            n.includes("docente") ||
-            n.includes("nombre") ||
-            n.includes("maestro")
-          );
-        }) || headers[0] || "";
+      // Detectar columna de nombre (prioridad 1: contiene 'nombre', prioridad 2: otros nombres sin id)
+      const detectedName =
+        headers.find((h) => !isIdHeader(h) && !isVectorHeader(h) && normalizeHeader(h).includes("nombre")) ||
+        headers.find((h) => isNameHeader(h)) ||
+        headers.find((h) => !isIdHeader(h) && !isVectorHeader(h)) ||
+        headers[0] ||
+        "";
 
-      setNameColumn(detected);
-      setupQueryConfigs(headers, detected);
+      setNameColumn(detectedName);
+      setupQueryConfigs(headers, detectedName, detectedId);
     } catch (err: any) {
       alert(err.message || "Error al procesar archivo de profesores");
       setFile(null);
@@ -894,43 +980,125 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     try {
       // Formatear profesores e incorporar embeddings precalculados si está en modo Solo Match
       const profesoresList: Profesor[] = fileRows.map((row, idx) => {
+        // 1. Resolver ID del profesor sin alterarlo si existe en el archivo
+        let actualId: string | number | undefined = undefined;
+        if (idColumn && row[idColumn] !== undefined && row[idColumn] !== null && String(row[idColumn]).trim() !== "") {
+          actualId = row[idColumn];
+        } else if (row["ID Profesor"] !== undefined && row["ID Profesor"] !== null && String(row["ID Profesor"]).trim() !== "") {
+          actualId = row["ID Profesor"];
+        } else if (row["id"] !== undefined && row["id"] !== null && String(row["id"]).trim() !== "") {
+          actualId = row["id"];
+        } else if (row["ID"] !== undefined && row["ID"] !== null && String(row["ID"]).trim() !== "") {
+          actualId = row["ID"];
+        } else {
+          const foundIdKey = Object.keys(row).find(
+            (k) => isIdHeader(k) && row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ""
+          );
+          if (foundIdKey) {
+            actualId = row[foundIdKey];
+          }
+        }
+        // Si no se encontró ningún ID en el archivo, SOLO ENTONCES generarlo
+        if (actualId === undefined || actualId === null || String(actualId).trim() === "") {
+          actualId = idx + 1;
+        }
+
+        // 2. Resolver Nombre del profesor
+        let actualName = "";
+        if (nameColumn && row[nameColumn] !== undefined && row[nameColumn] !== null && String(row[nameColumn]).trim() !== "") {
+          actualName = String(row[nameColumn]).trim();
+        } else if (row["Nombre Profesor"] !== undefined && row["Nombre Profesor"] !== null && String(row["Nombre Profesor"]).trim() !== "") {
+          actualName = String(row["Nombre Profesor"]).trim();
+        } else if (row["nombre_profesor"] !== undefined && row["nombre_profesor"] !== null && String(row["nombre_profesor"]).trim() !== "") {
+          actualName = String(row["nombre_profesor"]).trim();
+        } else {
+          const foundNameKey = Object.keys(row).find(
+            (k) => isNameHeader(k) && row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ""
+          );
+          if (foundNameKey) {
+            actualName = String(row[foundNameKey]).trim();
+          }
+        }
+        if (!actualName) {
+          actualName = `Profesor ${actualId}`;
+        }
+
         const prof: Profesor = {
-          id: idx + 1,
-          nombre_profesor: (nameColumn ? row[nameColumn] : "") || `Profesor ${idx + 1}`,
-          ...row,
+          ...row, // Preservar todos los campos del archivo del usuario sin alterar ninguno
+          id: actualId,
+          nombre_profesor: actualName,
         };
+
+        // Si el archivo tenía columnas explícitas "ID Profesor" o "Nombre Profesor", asegurarnos de que mantengan sus valores originales
+        if (row["ID Profesor"] !== undefined) {
+          prof["ID Profesor"] = row["ID Profesor"];
+        } else if (idColumn && row[idColumn] !== undefined) {
+          prof["ID Profesor"] = row[idColumn];
+        }
+        if (row["Nombre Profesor"] !== undefined) {
+          prof["Nombre Profesor"] = row["Nombre Profesor"];
+        } else if (nameColumn && row[nameColumn] !== undefined) {
+          prof["Nombre Profesor"] = row[nameColumn];
+        }
 
         if (importMode === "only_match") {
           const fieldEmbeddings: Record<string, number[]> = {};
           for (const config of activeConfigs) {
-            const col = config.embeddingColumn || `Embedding Profesor (${config.field})`;
-            const raw = row[col];
-            if (raw) {
-              const vec = parseEmbeddingValue(raw);
-              if (vec && vec.length === 768) {
-                fieldEmbeddings[config.field] = vec;
+            let vec: number[] | null = null;
+            // 1. Probar columna configurada
+            if (config.embeddingColumn && row[config.embeddingColumn]) {
+              vec = parseEmbeddingValue(row[config.embeddingColumn]);
+            }
+            // 2. Probar formato estándar "Embedding Profesor (Campo)"
+            if (!vec && row[`Embedding Profesor (${config.field})`]) {
+              vec = parseEmbeddingValue(row[`Embedding Profesor (${config.field})`]);
+            }
+            // 3. Probar coincidencia difusa en encabezados del archivo
+            if (!vec) {
+              const targetClean = cleanHeaderToken(`embeddingprofesor${config.field}`);
+              const altClean = cleanHeaderToken(`embedding${config.field}`);
+              const foundCol = Object.keys(row).find((k) => {
+                const ck = cleanHeaderToken(k);
+                return ck === targetClean || ck === altClean;
+              });
+              if (foundCol && row[foundCol]) {
+                vec = parseEmbeddingValue(row[foundCol]);
               }
+            }
+
+            if (vec && vec.length === 768) {
+              fieldEmbeddings[config.field] = vec;
             }
           }
           prof.fieldEmbeddings = fieldEmbeddings;
 
           // Vector compuesto/único de respaldo si existe
+          let singleVec: number[] | null = null;
           const singleRaw =
             row["Embedding Profesor"] ||
             row["embedding_768"] ||
             row["embedding"] ||
             row["vector"];
           if (singleRaw) {
-            const singleVec = parseEmbeddingValue(singleRaw);
-            if (singleVec && singleVec.length === 768) {
-              prof.embedding_768 = singleVec;
-              // Si no había vectores por campo, poblar con el vector único para permitir matching
-              activeConfigs.forEach((c) => {
-                if (!prof.fieldEmbeddings![c.field]) {
-                  prof.fieldEmbeddings![c.field] = singleVec;
-                }
-              });
+            singleVec = parseEmbeddingValue(singleRaw);
+          } else {
+            const foundCol = Object.keys(row).find((k) => {
+              const ck = cleanHeaderToken(k);
+              return ck === "embeddingprofesor" || ck === "embedding768" || ck === "vector";
+            });
+            if (foundCol && row[foundCol]) {
+              singleVec = parseEmbeddingValue(row[foundCol]);
             }
+          }
+
+          if (singleVec && singleVec.length === 768) {
+            prof.embedding_768 = singleVec;
+            // Si no había vectores por campo, poblar con el vector único para permitir matching
+            activeConfigs.forEach((c) => {
+              if (!prof.fieldEmbeddings![c.field]) {
+                prof.fieldEmbeddings![c.field] = singleVec!;
+              }
+            });
           }
         }
 
@@ -1026,11 +1194,66 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     setProfessorEmbeddingsList([]);
 
     try {
-      const profesoresList: Profesor[] = fileRows.map((row, idx) => ({
-        id: idx + 1,
-        nombre_profesor: (nameColumn ? row[nameColumn] : "") || `Profesor ${idx + 1}`,
-        ...row,
-      }));
+      const profesoresList: Profesor[] = fileRows.map((row, idx) => {
+        let actualId: string | number | undefined = undefined;
+        if (idColumn && row[idColumn] !== undefined && row[idColumn] !== null && String(row[idColumn]).trim() !== "") {
+          actualId = row[idColumn];
+        } else if (row["ID Profesor"] !== undefined && row["ID Profesor"] !== null && String(row["ID Profesor"]).trim() !== "") {
+          actualId = row["ID Profesor"];
+        } else if (row["id"] !== undefined && row["id"] !== null && String(row["id"]).trim() !== "") {
+          actualId = row["id"];
+        } else if (row["ID"] !== undefined && row["ID"] !== null && String(row["ID"]).trim() !== "") {
+          actualId = row["ID"];
+        } else {
+          const foundIdKey = Object.keys(row).find(
+            (k) => isIdHeader(k) && row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ""
+          );
+          if (foundIdKey) {
+            actualId = row[foundIdKey];
+          }
+        }
+        if (actualId === undefined || actualId === null || String(actualId).trim() === "") {
+          actualId = idx + 1;
+        }
+
+        let actualName = "";
+        if (nameColumn && row[nameColumn] !== undefined && row[nameColumn] !== null && String(row[nameColumn]).trim() !== "") {
+          actualName = String(row[nameColumn]).trim();
+        } else if (row["Nombre Profesor"] !== undefined && row["Nombre Profesor"] !== null && String(row["Nombre Profesor"]).trim() !== "") {
+          actualName = String(row["Nombre Profesor"]).trim();
+        } else if (row["nombre_profesor"] !== undefined && row["nombre_profesor"] !== null && String(row["nombre_profesor"]).trim() !== "") {
+          actualName = String(row["nombre_profesor"]).trim();
+        } else {
+          const foundNameKey = Object.keys(row).find(
+            (k) => isNameHeader(k) && row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== ""
+          );
+          if (foundNameKey) {
+            actualName = String(row[foundNameKey]).trim();
+          }
+        }
+        if (!actualName) {
+          actualName = `Profesor ${actualId}`;
+        }
+
+        const prof: Profesor = {
+          ...row,
+          id: actualId,
+          nombre_profesor: actualName,
+        };
+
+        if (row["ID Profesor"] !== undefined) {
+          prof["ID Profesor"] = row["ID Profesor"];
+        } else if (idColumn && row[idColumn] !== undefined) {
+          prof["ID Profesor"] = row[idColumn];
+        }
+        if (row["Nombre Profesor"] !== undefined) {
+          prof["Nombre Profesor"] = row["Nombre Profesor"];
+        } else if (nameColumn && row[nameColumn] !== undefined) {
+          prof["Nombre Profesor"] = row[nameColumn];
+        }
+
+        return prof;
+      });
 
       // Procesar en lotes de 15 profesores con el RateLimitManager
       const BATCH_SIZE = 15;
@@ -1092,25 +1315,29 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     if (!items.length) return;
 
     const rows = items.map((item) => {
-      const rowData: Record<string, any> = {
-        "ID Profesor": item.profesor.id,
-        "Nombre Profesor": item.profesor.nombre_profesor,
-      };
+      const rowData: Record<string, any> = {};
 
+      // Primero, escribir todas las columnas del archivo original respetando orden y valores
       fileHeaders.forEach((h) => {
-        if (h !== nameColumn) {
-          let val = item.profesor[h] ?? "";
-          if (
-            item.sanitizationStatus === "sanitized" &&
-            typeof val === "string" &&
-            regexFilterConfig?.enabled
-          ) {
-            const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
-            val = res.sanitizedText;
-          }
-          rowData[h] = val;
+        let val = item.profesor[h] ?? "";
+        if (
+          item.sanitizationStatus === "sanitized" &&
+          typeof val === "string" &&
+          regexFilterConfig?.enabled
+        ) {
+          const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
+          val = res.sanitizedText;
         }
+        rowData[h] = val;
       });
+
+      // Asegurar que existan ID Profesor y Nombre Profesor si el archivo no los tenía explícitamente
+      if (rowData["ID Profesor"] === undefined) {
+        rowData["ID Profesor"] = item.profesor.id;
+      }
+      if (rowData["Nombre Profesor"] === undefined) {
+        rowData["Nombre Profesor"] = item.profesor.nombre_profesor;
+      }
 
       // Embedding 768d global/compuesto del profesor
       rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
@@ -1260,28 +1487,71 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
   // ── Columnas Disponibles para Selección en la Descarga de Matches ──
   const allAvailableDocenteCols = useMemo(() => {
-    const cols: { key: string; label: string; isStandard?: boolean; isVector?: boolean }[] = [
-      {
-        key: "Nombre Profesor",
-        label: nameColumn ? `Nombre Profesor (${nameColumn})` : "Nombre Profesor",
-        isStandard: true,
-      },
-      { key: "ID Profesor", label: "ID Profesor", isStandard: true },
-    ];
-    const seen = new Set<string>(["id", "ID Profesor", "nombre_profesor", "Nombre Profesor"]);
-    if (nameColumn) seen.add(nameColumn);
+    const cols: { key: string; label: string; isStandard?: boolean; isVector?: boolean }[] = [];
+    const seen = new Set<string>();
 
+    const fileHasIdCol = fileHeaders.some(
+      (h) => isIdHeader(h) || h === idColumn || h === "ID Profesor"
+    );
+    const fileHasNameCol = fileHeaders.some(
+      (h) => isNameHeader(h) || h === nameColumn || h === "Nombre Profesor"
+    );
+
+    // Si el archivo no tiene columna de ID, ofrecemos ID Profesor estándar (autogenerado)
+    if (!fileHasIdCol) {
+      cols.push({ key: "ID Profesor", label: "ID Profesor (Autogenerado)", isStandard: true });
+      seen.add("ID Profesor");
+    }
+
+    // Si el archivo no tiene columna de Nombre, ofrecemos Nombre Profesor estándar
+    if (!fileHasNameCol) {
+      cols.push({ key: "Nombre Profesor", label: "Nombre Profesor", isStandard: true });
+      seen.add("Nombre Profesor");
+    }
+
+    // Incorporar todas las columnas del archivo original respetando su presencia, orden y valores
     fileHeaders.forEach((h) => {
-      if (!seen.has(h) && h !== "embedding_768" && h !== "vectors" && h !== "fieldEmbeddings") {
+      if (
+        h === "embedding_768" ||
+        h === "vectors" ||
+        h === "fieldEmbeddings" ||
+        h === "Embedding Profesor" ||
+        h.toLowerCase().startsWith("embedding profesor (")
+      ) {
+        return;
+      }
+
+      if (!seen.has(h)) {
         seen.add(h);
-        cols.push({ key: h, label: h });
+        const isId = isIdHeader(h) || h === idColumn;
+        const isName = isNameHeader(h) || h === nameColumn;
+        cols.push({
+          key: h,
+          label:
+            isName && h !== "Nombre Profesor"
+              ? `${h} (Nombre Profesor)`
+              : isId && h !== "ID Profesor"
+              ? `${h} (ID Profesor)`
+              : h,
+          isStandard: isId || isName,
+        });
       }
     });
 
+    // Campos adicionales que hayan venido en los resultados de matchResults
     matchResults.forEach((r) => {
       if (r.profesor) {
         Object.keys(r.profesor).forEach((k) => {
-          if (!seen.has(k) && k !== "embedding_768" && k !== "vectors" && k !== "fieldEmbeddings") {
+          if (
+            !seen.has(k) &&
+            k !== "id" &&
+            k !== "nombre_profesor" &&
+            k !== "embedding_768" &&
+            k !== "vectors" &&
+            k !== "fieldEmbeddings" &&
+            k !== "Embedding Profesor" &&
+            !k.startsWith("Embedding Profesor (")
+          ) {
             seen.add(k);
             cols.push({ key: k, label: k });
           }
@@ -1289,29 +1559,48 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       }
     });
 
+    // Estado anti-sesgo
     cols.push({ key: "Filtro Anti-Sesgo", label: "Filtro Anti-Sesgo (Estado)", isStandard: true });
-    cols.push({ key: "Embedding Profesor", label: "Embedding 768d Profesor", isStandard: false, isVector: true });
 
-    // Detectar si hay fieldEmbeddings en los profesores
+    // Vector compuesto
+    cols.push({
+      key: "Embedding Profesor",
+      label: "Embedding 768d Profesor (Compuesto)",
+      isStandard: false,
+      isVector: true,
+    });
+
+    // Vectores por campo
     const fieldEmbeddingsSet = new Set<string>();
     matchResults.forEach((r) => {
       if (r.fieldEmbeddings) {
         Object.keys(r.fieldEmbeddings).forEach((f) => fieldEmbeddingsSet.add(f));
       }
     });
+    fileHeaders.forEach((h) => {
+      const m = h.match(/^Embedding Profesor \((.+)\)$/i);
+      if (m && m[1]) {
+        fieldEmbeddingsSet.add(m[1]);
+      }
+    });
+
     fieldEmbeddingsSet.forEach((f) => {
-      const cfg = queryConfigs.find((c) => c.field === f);
+      const cfg = queryConfigs.find((c) => c.field === f || c.label === f);
       const label = cfg?.label || f;
-      cols.push({
-        key: `Embedding Profesor (${label})`,
-        label: `Embedding Profesor (${label})`,
-        isStandard: false,
-        isVector: true,
-      });
+      const key = `Embedding Profesor (${label})`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        cols.push({
+          key,
+          label: key,
+          isStandard: false,
+          isVector: true,
+        });
+      }
     });
 
     return cols;
-  }, [fileHeaders, nameColumn, matchResults, queryConfigs]);
+  }, [fileHeaders, nameColumn, idColumn, matchResults, queryConfigs]);
 
   const allAvailableAsigCols = useMemo(() => {
     const cols: { key: string; label: string; isStandard?: boolean; isVector?: boolean }[] = [
@@ -1473,7 +1762,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const selectMinimalExportCols = () => {
     const nextDoc: Record<string, boolean> = {};
     allAvailableDocenteCols.forEach((c) => {
-      nextDoc[c.key] = c.key === "Nombre Profesor" || c.key === "ID Profesor";
+      nextDoc[c.key] = Boolean(c.isStandard && c.key !== "Filtro Anti-Sesgo");
     });
     updateSelectedDocenteCols(() => nextDoc);
 
@@ -1613,38 +1902,52 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       return results.map((item) => {
         const rowData: Record<string, any> = {};
 
-        // 1. Columnas seleccionadas del docente
-        if (isDocenteColSelected("ID Profesor")) {
-          rowData["ID Profesor"] = item.profesor.id ?? "";
-        }
-        if (isDocenteColSelected("Nombre Profesor")) {
-          rowData["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
-        }
+        // 1. Columnas seleccionadas del docente (respetando orden, valores originales e ID/Nombre)
+        allAvailableDocenteCols.forEach((c) => {
+          if (!isDocenteColSelected(c.key)) return;
 
-        const handledDocenteKeys = new Set<string>([
-          "id",
-          "ID Profesor",
-          "nombre_profesor",
-          "Nombre Profesor",
-        ]);
-        if (nameColumn) handledDocenteKeys.add(nameColumn);
-
-        const allDocenteCols = new Set<string>();
-        fileHeaders.forEach((h) => allDocenteCols.add(h));
-        Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
-
-        allDocenteCols.forEach((col) => {
-          if (
-            handledDocenteKeys.has(col) ||
-            col === "embedding_768" ||
-            col === "vectors" ||
-            col === "fieldEmbeddings"
-          ) {
-            return;
-          }
-
-          if (isDocenteColSelected(col)) {
-            let val = item.profesor[col] ?? "";
+          if (c.key === "ID Profesor") {
+            rowData["ID Profesor"] =
+              item.profesor["ID Profesor"] ??
+              (idColumn ? item.profesor[idColumn] : undefined) ??
+              item.profesor.id ??
+              "";
+          } else if (c.key === "Nombre Profesor") {
+            rowData["Nombre Profesor"] =
+              item.profesor["Nombre Profesor"] ??
+              (nameColumn ? item.profesor[nameColumn] : undefined) ??
+              item.profesor.nombre_profesor ??
+              "";
+          } else if (c.key === "Filtro Anti-Sesgo") {
+            if (item.sanitizationStatus) {
+              rowData["Filtro Anti-Sesgo"] =
+                item.sanitizationStatus === "intact"
+                  ? "Intacto (Credencial pedagógica)"
+                  : item.sanitizationStatus === "sanitized"
+                  ? "Sanitizado (Sesgo mitigado)"
+                  : "Inactivo";
+            } else {
+              rowData["Filtro Anti-Sesgo"] = "Inactivo";
+            }
+          } else if (c.key === "Embedding Profesor") {
+            rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+          } else if (c.key.startsWith("Embedding Profesor (")) {
+            if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
+              const matchedEntry = Object.entries(item.fieldEmbeddings).find(([field]) => {
+                const cfg = queryConfigs.find((qc) => qc.field === field);
+                const label = cfg?.label || field;
+                return c.key === `Embedding Profesor (${label})`;
+              });
+              if (matchedEntry) {
+                rowData[c.key] = formatEmbeddingForExport(matchedEntry[1]);
+              } else {
+                rowData[c.key] = "";
+              }
+            } else {
+              rowData[c.key] = "";
+            }
+          } else {
+            let val = item.profesor[c.key] ?? "";
             if (
               item.sanitizationStatus === "sanitized" &&
               typeof val === "string" &&
@@ -1653,34 +1956,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
               val = res.sanitizedText;
             }
-            rowData[col] = val;
+            rowData[c.key] = val;
           }
-          handledDocenteKeys.add(col);
         });
-
-        if (isDocenteColSelected("Filtro Anti-Sesgo") && item.sanitizationStatus) {
-          rowData["Filtro Anti-Sesgo"] =
-            item.sanitizationStatus === "intact"
-              ? "Intacto (Credencial pedagógica)"
-              : item.sanitizationStatus === "sanitized"
-              ? "Sanitizado (Sesgo mitigado)"
-              : "Inactivo";
-        }
-
-        if (isDocenteColSelected("Embedding Profesor")) {
-          rowData["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
-        }
-
-        if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
-          Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
-            const cfg = queryConfigs.find((c) => c.field === field);
-            const label = cfg?.label || field;
-            const key = `Embedding Profesor (${label})`;
-            if (isDocenteColSelected(key)) {
-              rowData[key] = formatEmbeddingForExport(vec);
-            }
-          });
-        }
 
         if (isMetricColSelected("asignaturas_asignadas")) {
           rowData["Asignaturas Asignadas"] = item.matches.length;
@@ -1797,6 +2075,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       filterMode,
       topK,
       nameColumn,
+      idColumn,
       fileHeaders,
       regexFilterConfig,
       distancePairs,
@@ -1805,6 +2084,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       isDocenteColSelected,
       isAsigColSelected,
       isMetricColSelected,
+      allAvailableDocenteCols,
     ]
   );
 
@@ -1818,37 +2098,51 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       results.forEach((item) => {
         const extractDocenteData = () => {
           const d: Record<string, any> = {};
-          if (isDocenteColSelected("ID Profesor")) {
-            d["ID Profesor"] = item.profesor.id ?? "";
-          }
-          if (isDocenteColSelected("Nombre Profesor")) {
-            d["Nombre Profesor"] = item.profesor.nombre_profesor ?? "";
-          }
+          allAvailableDocenteCols.forEach((c) => {
+            if (!isDocenteColSelected(c.key)) return;
 
-          const handledDocenteKeys = new Set<string>([
-            "id",
-            "ID Profesor",
-            "nombre_profesor",
-            "Nombre Profesor",
-          ]);
-          if (nameColumn) handledDocenteKeys.add(nameColumn);
-
-          const allDocenteCols = new Set<string>();
-          fileHeaders.forEach((h) => allDocenteCols.add(h));
-          Object.keys(item.profesor).forEach((k) => allDocenteCols.add(k));
-
-          allDocenteCols.forEach((col) => {
-            if (
-              handledDocenteKeys.has(col) ||
-              col === "embedding_768" ||
-              col === "vectors" ||
-              col === "fieldEmbeddings"
-            ) {
-              return;
-            }
-
-            if (isDocenteColSelected(col)) {
-              let val = item.profesor[col] ?? "";
+            if (c.key === "ID Profesor") {
+              d["ID Profesor"] =
+                item.profesor["ID Profesor"] ??
+                (idColumn ? item.profesor[idColumn] : undefined) ??
+                item.profesor.id ??
+                "";
+            } else if (c.key === "Nombre Profesor") {
+              d["Nombre Profesor"] =
+                item.profesor["Nombre Profesor"] ??
+                (nameColumn ? item.profesor[nameColumn] : undefined) ??
+                item.profesor.nombre_profesor ??
+                "";
+            } else if (c.key === "Filtro Anti-Sesgo") {
+              if (item.sanitizationStatus) {
+                d["Filtro Anti-Sesgo"] =
+                  item.sanitizationStatus === "intact"
+                    ? "Intacto (Credencial pedagógica)"
+                    : item.sanitizationStatus === "sanitized"
+                    ? "Sanitizado (Sesgo mitigado)"
+                    : "Inactivo";
+              } else {
+                d["Filtro Anti-Sesgo"] = "Inactivo";
+              }
+            } else if (c.key === "Embedding Profesor") {
+              d["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
+            } else if (c.key.startsWith("Embedding Profesor (")) {
+              if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
+                const matchedEntry = Object.entries(item.fieldEmbeddings).find(([field]) => {
+                  const cfg = queryConfigs.find((qc) => qc.field === field);
+                  const label = cfg?.label || field;
+                  return c.key === `Embedding Profesor (${label})`;
+                });
+                if (matchedEntry) {
+                  d[c.key] = formatEmbeddingForExport(matchedEntry[1]);
+                } else {
+                  d[c.key] = "";
+                }
+              } else {
+                d[c.key] = "";
+              }
+            } else {
+              let val = item.profesor[c.key] ?? "";
               if (
                 item.sanitizationStatus === "sanitized" &&
                 typeof val === "string" &&
@@ -1857,34 +2151,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 const res = sanitizarCvParaModelo(val, regexFilterConfig, false);
                 val = res.sanitizedText;
               }
-              d[col] = val;
+              d[c.key] = val;
             }
-            handledDocenteKeys.add(col);
           });
-
-          if (isDocenteColSelected("Filtro Anti-Sesgo") && item.sanitizationStatus) {
-            d["Filtro Anti-Sesgo"] =
-              item.sanitizationStatus === "intact"
-                ? "Intacto (Credencial pedagógica)"
-                : item.sanitizationStatus === "sanitized"
-                ? "Sanitizado (Sesgo mitigado)"
-                : "Inactivo";
-          }
-
-          if (isDocenteColSelected("Embedding Profesor")) {
-            d["Embedding Profesor"] = formatEmbeddingForExport(item.embedding_768);
-          }
-
-          if (item.fieldEmbeddings && typeof item.fieldEmbeddings === "object") {
-            Object.entries(item.fieldEmbeddings).forEach(([field, vec]) => {
-              const cfg = queryConfigs.find((c) => c.field === field);
-              const label = cfg?.label || field;
-              const key = `Embedding Profesor (${label})`;
-              if (isDocenteColSelected(key)) {
-                d[key] = formatEmbeddingForExport(vec);
-              }
-            });
-          }
 
           return d;
         };
@@ -1987,6 +2256,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     },
     [
       nameColumn,
+      idColumn,
       fileHeaders,
       regexFilterConfig,
       distancePairs,
@@ -1995,6 +2265,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       isDocenteColSelected,
       isAsigColSelected,
       isMetricColSelected,
+      allAvailableDocenteCols,
     ]
   );
 
@@ -2625,22 +2896,43 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           /* Vista Previa de Primeras 5 Filas de Docentes */
           <div className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-              <div className="flex items-center gap-2">
-                <span className="font-semibold text-slate-300">Columna con Nombre del Profesor:</span>
-                <select
-                  value={nameColumn}
-                  onChange={(e) => {
-                    setNameColumn(e.target.value);
-                    setupQueryConfigs(fileHeaders, e.target.value);
-                  }}
-                  className="rounded-lg border border-white/15 bg-slate-950 px-3 py-1.5 text-xs text-indigo-300 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                >
-                  {fileHeaders.map((h) => (
-                    <option key={h} value={h}>
-                      {h}
-                    </option>
-                  ))}
-                </select>
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-slate-300">Columna con Nombre del Profesor:</span>
+                  <select
+                    value={nameColumn}
+                    onChange={(e) => {
+                      setNameColumn(e.target.value);
+                      setupQueryConfigs(fileHeaders, e.target.value, idColumn);
+                    }}
+                    className="rounded-lg border border-white/15 bg-slate-950 px-3 py-1.5 text-xs text-indigo-300 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  >
+                    {fileHeaders.map((h) => (
+                      <option key={h} value={h}>
+                        {h}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-slate-300">Columna con ID del Profesor (opcional):</span>
+                  <select
+                    value={idColumn}
+                    onChange={(e) => {
+                      setIdColumn(e.target.value);
+                      setupQueryConfigs(fileHeaders, nameColumn, e.target.value);
+                    }}
+                    className="rounded-lg border border-white/15 bg-slate-950 px-3 py-1.5 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                  >
+                    <option value="">(Autogenerar ID si no existe en archivo)</option>
+                    {fileHeaders.map((h) => (
+                      <option key={h} value={h}>
+                        {h}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               <span className="text-slate-400">
@@ -2653,9 +2945,10 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px] tracking-wider border-b border-white/10">
                   <tr>
                     <th className="px-3 py-2.5">#</th>
+                    <th className="px-3 py-2.5 font-bold text-cyan-300">ID</th>
                     <th className="px-3 py-2.5 font-bold text-indigo-300">Profesor</th>
                     {fileHeaders
-                      .filter((h) => h !== nameColumn)
+                      .filter((h) => h !== nameColumn && h !== idColumn)
                       .slice(0, 4)
                       .map((h) => (
                         <th key={h} className="px-3 py-2.5">
@@ -2665,22 +2958,32 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5 text-slate-300">
-                  {fileRows.slice(0, 5).map((row, idx) => (
-                    <tr key={idx} className="hover:bg-white/[0.02]">
-                      <td className="px-3 py-2 font-mono text-slate-500">{idx + 1}</td>
-                      <td className="px-3 py-2 font-semibold text-white">
-                        {nameColumn ? row[nameColumn] : "—"}
-                      </td>
-                      {fileHeaders
-                        .filter((h) => h !== nameColumn)
-                        .slice(0, 4)
-                        .map((h) => (
-                          <td key={h} className="px-3 py-2 truncate max-w-xs text-slate-400">
-                            {row[h] || "—"}
-                          </td>
-                        ))}
-                    </tr>
-                  ))}
+                  {fileRows.slice(0, 5).map((row, idx) => {
+                    const rowId =
+                      idColumn && row[idColumn] !== undefined && String(row[idColumn]).trim() !== ""
+                        ? row[idColumn]
+                        : row["ID Profesor"] || row["id"] || row["ID"] || (idx + 1);
+                    const rowName =
+                      nameColumn && row[nameColumn] !== undefined && String(row[nameColumn]).trim() !== ""
+                        ? row[nameColumn]
+                        : row["Nombre Profesor"] || row["Nombre"] || `Profesor ${rowId}`;
+
+                    return (
+                      <tr key={idx} className="hover:bg-white/[0.02]">
+                        <td className="px-3 py-2 font-mono text-slate-500">{idx + 1}</td>
+                        <td className="px-3 py-2 font-mono text-cyan-300 font-semibold">{rowId}</td>
+                        <td className="px-3 py-2 font-semibold text-white">{rowName}</td>
+                        {fileHeaders
+                          .filter((h) => h !== nameColumn && h !== idColumn)
+                          .slice(0, 4)
+                          .map((h) => (
+                            <td key={h} className="px-3 py-2 truncate max-w-xs text-slate-400">
+                              {row[h] || "—"}
+                            </td>
+                          ))}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -4419,12 +4722,12 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     >
                       <div className="flex items-center gap-3">
                         <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500/20 to-purple-500/20 border border-white/10 font-bold text-xs text-indigo-300">
-                          {result.profesor.nombre_profesor.slice(0, 2).toUpperCase()}
+                          {(result.profesor.nombre_profesor || "PR").slice(0, 2).toUpperCase()}
                         </div>
                         <div>
                           <div className="flex items-center gap-2">
                             <h4 className="text-xs sm:text-sm font-bold text-white">
-                              {result.profesor.nombre_profesor}
+                              {result.profesor.nombre_profesor || `Profesor ${profId}`}
                             </h4>
                             <span className="text-[10px] text-slate-500 font-mono">
                               ID: {profId}
@@ -4574,6 +4877,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               "vectors",
                               "fieldEmbeddings",
                               nameColumn,
+                              idColumn,
                               ...queryConfigs.filter((c) => c.active).map((c) => c.field),
                             ]);
                             const otherKeys = Array.from(
@@ -4817,11 +5121,25 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         onClose={() => setIsRegexModalOpen(false)}
         config={regexFilterConfig}
         onChangeConfig={handleUpdateRegexFilterConfig}
-        profesores={fileRows.map((r, i) => ({
-          id: i + 1,
-          nombre_profesor: (nameColumn ? r[nameColumn] : "") || `Profesor ${i + 1}`,
-          ...r,
-        }))}
+        profesores={fileRows.map((r, i) => {
+          const actualId =
+            (idColumn && r[idColumn] !== undefined && String(r[idColumn]).trim() !== "" ? r[idColumn] : undefined) ||
+            r["ID Profesor"] ||
+            r["id"] ||
+            r["ID"] ||
+            (i + 1);
+          const actualName =
+            (nameColumn && r[nameColumn] !== undefined && String(r[nameColumn]).trim() !== "" ? r[nameColumn] : undefined) ||
+            r["Nombre Profesor"] ||
+            r["nombre_profesor"] ||
+            r["Nombre"] ||
+            `Profesor ${actualId}`;
+          return {
+            ...r,
+            id: actualId,
+            nombre_profesor: actualName,
+          };
+        })}
       />
     </div>
   );
