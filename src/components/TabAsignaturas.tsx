@@ -512,6 +512,7 @@ export default function TabAsignaturas({
     setUploadProgress(10);
     setStatusMessage("Preparando columnas para inserción en Supabase...");
     setUploadReport(null);
+    let totalInserted = 0;
 
     try {
       // Pre-crear columnas marcadas como 'create' que aún no estén en Supabase
@@ -648,7 +649,7 @@ export default function TabAsignaturas({
       // Tamaño de lote dinámico: 15 si incluye columnas vectoriales para evitar timeouts en Supabase, o 25 si es solo texto
       const DB_BATCH_SIZE = selectedVectorColumns.length > 0 ? 15 : 25;
       const totalDbBatches = Math.ceil(validRows.length / DB_BATCH_SIZE);
-      let totalInserted = 0;
+      totalInserted = 0;
 
       // Subida con reintento automático y división de lote ante posibles timeouts
       const uploadBatchWithRetry = async (
