@@ -42,6 +42,10 @@ import {
   SlidersHorizontal,
   Table,
   Database,
+  Cloud,
+  Share2,
+  Save,
+  FolderOpen,
 } from "lucide-react";
 import {
   Profesor,
@@ -54,12 +58,17 @@ import {
   ProfessorImportMode,
   RegexFilterConfig,
   DistancePairConfig,
+  SavedClusterConfiguration,
+  ClusterVerificationResult,
 } from "@/types";
 import {
   DEFAULT_REGEX_FILTER_CONFIG,
   sanitizarCvParaModelo,
 } from "@/lib/sanitizer/cv-sanitizer";
 import { RegexFilterModal } from "@/components/RegexFilterModal";
+import ClusterConfigModal, {
+  verifyClusterConfiguration,
+} from "@/components/ClusterConfigModal";
 import {
   parseSpreadsheetFile,
   apiFetch,
@@ -179,6 +188,13 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [isSyncingWithDb, setIsSyncingWithDb] = useState<boolean>(false);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+
+  // ── Estados de Modal y Verificación de Plantillas de Clusters en Supabase ──
+  const [isClusterConfigModalOpen, setIsClusterConfigModalOpen] = useState(false);
+  const [clusterConfigModalTab, setClusterConfigModalTab] = useState<"load" | "save">("load");
+  const [activeLoadedConfig, setActiveLoadedConfig] = useState<SavedClusterConfiguration | null>(null);
+  const [clusterVerification, setClusterVerification] = useState<ClusterVerificationResult | null>(null);
+  const [dismissedVerification, setDismissedVerification] = useState(false);
 
   // ── Configuración de Pares de Distancia Multi-Vector (Profesor ↔ Asignatura) ──
   const [availableAsigVectorCols, setAvailableAsigVectorCols] = useState<string[]>(["embedding_768"]);
@@ -488,6 +504,79 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     const set = new Set([...detectedClusters, ...customClusters]);
     return Array.from(set).sort();
   }, [detectedClusters, customClusters]);
+
+  // ── Clusters activos presentes en las asignaturas actuales (filtradas o catálogo completo) ──
+  const currentActiveAsignaturaClusters = useMemo(() => {
+    if (isFilterEffective && filteredAsignaturas.length > 0) {
+      const set = new Set<string>();
+      filteredAsignaturas.forEach((a) => {
+        const val = (a as any)[clusterColumn] || a.cluster;
+        if (val && String(val).trim()) set.add(String(val).trim());
+      });
+      return Array.from(set).sort();
+    }
+    return detectedClusters;
+  }, [isFilterEffective, filteredAsignaturas, clusterColumn, detectedClusters]);
+
+  // Re-verificar configuración activa contra asignaturas actuales cuando cambian
+  useEffect(() => {
+    if (!activeLoadedConfig) {
+      setClusterVerification(null);
+      return;
+    }
+
+    const configClusters = Array.from(
+      new Set([
+        ...Object.keys(activeLoadedConfig.clusterBetas || {}),
+        ...(activeLoadedConfig.customClusters || []),
+        ...customClusters,
+      ])
+    );
+
+    const result = verifyClusterConfiguration(configClusters, currentActiveAsignaturaClusters);
+    setClusterVerification(result);
+  }, [activeLoadedConfig, customClusters, currentActiveAsignaturaClusters]);
+
+  // Manejador para cargar una configuración desde el modal de Supabase
+  const handleLoadConfiguration = (config: SavedClusterConfiguration) => {
+    setActiveLoadedConfig(config);
+    if (config.clusterColumn) {
+      setClusterColumn(config.clusterColumn);
+    }
+    if (config.clusterBetas && Object.keys(config.clusterBetas).length > 0) {
+      setClusterBetas(config.clusterBetas);
+    }
+    if (config.defaultBetas && Object.keys(config.defaultBetas).length > 0) {
+      setDefaultBetas(config.defaultBetas);
+    }
+    if (Array.isArray(config.customClusters)) {
+      setCustomClusters(config.customClusters);
+    }
+
+    // Verificación inmediata contra asignaturas actuales
+    const configClusters = Object.keys(config.clusterBetas || {}).concat(
+      config.customClusters || []
+    );
+    const result = verifyClusterConfiguration(configClusters, currentActiveAsignaturaClusters);
+    setClusterVerification(result);
+    setDismissedVerification(false);
+  };
+
+  // Manejador para agregar clusters faltantes a la configuración
+  const handleAddMissingClustersToConfig = () => {
+    if (!clusterVerification || clusterVerification.missingInConfig.length === 0) return;
+    setCustomClusters((prev) => {
+      const set = new Set([...prev, ...clusterVerification.missingInConfig]);
+      return Array.from(set).sort();
+    });
+  };
+
+  // Restablecer configuración activa cargada
+  const handleClearActiveLoadedConfig = () => {
+    setActiveLoadedConfig(null);
+    setClusterVerification(null);
+    setDismissedVerification(false);
+  };
 
   const activeFields = useMemo(() => {
     return queryConfigs.filter((c) => c.active).map((c) => c.field);
@@ -3490,39 +3579,220 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 </p>
               </div>
 
-              {/* Selector de Columna de Cluster */}
-              <div className="flex items-center gap-2 bg-slate-900 border border-white/10 rounded-xl px-3 py-1.5 text-xs">
-                <span className="text-slate-400 font-medium">Columna de Cluster:</span>
-                <select
-                  value={clusterColumn}
-                  onChange={(e) => {
-                    const newCol = e.target.value;
-                    setClusterColumn(newCol);
-                    syncCatalogAndClusters(newCol);
-                  }}
-                  className="rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
-                >
-                  {availableClusterColumns.map((col) => (
-                    <option key={col} value={col}>
-                      {col} {col === "cluster" ? "(Por defecto)" : ""}
-                    </option>
-                  ))}
-                </select>
+              {/* Acciones de Cluster: Columna, Plantillas Supabase y Guardar */}
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Selector de Columna de Cluster */}
+                <div className="flex items-center gap-2 bg-slate-900 border border-white/10 rounded-xl px-3 py-1.5 text-xs">
+                  <span className="text-slate-400 font-medium">Columna:</span>
+                  <select
+                    value={clusterColumn}
+                    onChange={(e) => {
+                      const newCol = e.target.value;
+                      setClusterColumn(newCol);
+                      syncCatalogAndClusters(newCol);
+                    }}
+                    className="rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                  >
+                    {availableClusterColumns.map((col) => (
+                      <option key={col} value={col}>
+                        {col} {col === "cluster" ? "(Por defecto)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => syncCatalogAndClusters()}
+                    disabled={isSyncingWithDb || isLoadingClusters}
+                    className="p-1 rounded-md hover:bg-white/10 text-cyan-400 transition cursor-pointer"
+                    title="Recargar clusters y asignaturas desde Supabase"
+                  >
+                    <RefreshCw
+                      className={`h-3 w-3 ${
+                        isSyncingWithDb || isLoadingClusters ? "animate-spin text-cyan-400" : ""
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Botón Cargar / Gestionar Plantillas Supabase */}
                 <button
                   type="button"
-                  onClick={() => syncCatalogAndClusters()}
-                  disabled={isSyncingWithDb || isLoadingClusters}
-                  className="p-1 rounded-md hover:bg-white/10 text-cyan-400 transition cursor-pointer"
-                  title="Recargar clusters y asignaturas desde Supabase"
+                  onClick={() => {
+                    setClusterConfigModalTab("load");
+                    setIsClusterConfigModalOpen(true);
+                  }}
+                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition cursor-pointer shadow-sm ${
+                    activeLoadedConfig
+                      ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 hover:border-emerald-400"
+                      : "border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50 hover:border-cyan-400"
+                  }`}
+                  title="Cargar o gestionar configuraciones de clusters compartidas en Supabase"
                 >
-                  <RefreshCw
-                    className={`h-3 w-3 ${
-                      isSyncingWithDb || isLoadingClusters ? "animate-spin text-cyan-400" : ""
-                    }`}
-                  />
+                  <FolderOpen className="h-3.5 w-3.5" />
+                  <span>Plantillas Supabase</span>
+                  {activeLoadedConfig && (
+                    <span className="flex h-2 w-2 relative">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                    </span>
+                  )}
+                </button>
+
+                {/* Botón Guardar Plantilla Actual en Supabase */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setClusterConfigModalTab("save");
+                    setIsClusterConfigModalOpen(true);
+                  }}
+                  className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 px-3 py-1.5 text-xs font-semibold text-slate-200 transition cursor-pointer hover:border-white/20"
+                  title="Guardar la configuración actual en Supabase para compartirla con todo el equipo"
+                >
+                  <Save className="h-3.5 w-3.5 text-indigo-400" />
+                  <span>Guardar Plantilla</span>
                 </button>
               </div>
             </div>
+
+            {/* Banner de Plantilla Activa cargada desde Supabase */}
+            {activeLoadedConfig && (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-500/30 bg-indigo-950/30 p-3 text-xs text-indigo-200">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-1.5 rounded-lg bg-indigo-500/20 text-indigo-300">
+                    <Cloud className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-white text-xs">
+                        Plantilla Activa: {activeLoadedConfig.name}
+                      </span>
+                      {activeLoadedConfig.clusterColumn && (
+                        <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] font-mono text-indigo-300">
+                          Columna: {activeLoadedConfig.clusterColumn}
+                        </span>
+                      )}
+                      {activeLoadedConfig.author && (
+                        <span className="text-[11px] text-slate-400">
+                          por {activeLoadedConfig.author}
+                        </span>
+                      )}
+                    </div>
+                    {activeLoadedConfig.description && (
+                      <p className="text-[11px] text-slate-300 mt-0.5 line-clamp-1">
+                        {activeLoadedConfig.description}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {dismissedVerification && (
+                    <button
+                      type="button"
+                      onClick={() => setDismissedVerification(false)}
+                      className="text-[11px] font-medium text-indigo-300 hover:text-white underline cursor-pointer"
+                    >
+                      Ver estado de verificación
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleClearActiveLoadedConfig}
+                    className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
+                    title="Desvincular esta plantilla y mantener valores editados localmente"
+                  >
+                    <RotateCcw className="h-3 w-3 text-slate-400" />
+                    <span>Desvincular Plantilla</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Banner de Notificación y Verificación de Clusters contra Asignaturas Actuales */}
+            {clusterVerification && !dismissedVerification && (
+              <div>
+                {clusterVerification.isValid ? (
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-emerald-500/30 bg-emerald-950/30 p-3 text-xs text-emerald-200">
+                    <div className="flex items-center gap-2.5">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                      <div>
+                        <span className="font-semibold text-emerald-300">
+                          Verificación exitosa:
+                        </span>{" "}
+                        Todos los clusters de la configuración coinciden perfectamente con las asignaturas actuales ({clusterVerification.matchingClusters.length} clusters activos).
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDismissedVerification(true)}
+                      className="text-emerald-400 hover:text-emerald-200 p-1 rounded transition cursor-pointer"
+                      title="Ocultar aviso"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3.5 text-xs text-amber-200 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2 font-semibold text-amber-300">
+                        <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
+                        <span>Advertencia de compatibilidad con asignaturas actuales:</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setDismissedVerification(true)}
+                        className="text-amber-400 hover:text-amber-200 p-0.5 rounded transition cursor-pointer"
+                        title="Ocultar aviso"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+
+                    <div className="space-y-2 pl-6">
+                      {clusterVerification.missingInConfig.length > 0 && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-amber-900/20 border border-amber-500/20 rounded-lg p-2.5">
+                          <div className="space-y-0.5 max-w-xl">
+                            <div className="font-medium text-amber-200">
+                              ⚠️ {clusterVerification.missingInConfig.length} cluster(s) presentes en tus asignaturas no están configurados en esta plantilla:
+                            </div>
+                            <div className="font-mono text-[11px] text-amber-300/90 break-all">
+                              {clusterVerification.missingInConfig.slice(0, 6).join(", ")}
+                              {clusterVerification.missingInConfig.length > 6 ? ` (+${clusterVerification.missingInConfig.length - 6} más)` : ""}
+                            </div>
+                            <p className="text-[11px] text-amber-200/70">
+                              Estas asignaturas usarán por defecto los coeficientes Beta del tab <em>General / Sin Cluster</em>.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleAddMissingClustersToConfig}
+                            className="flex items-center gap-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 px-3 py-1.5 text-xs font-semibold text-amber-100 transition cursor-pointer shrink-0 shadow-sm"
+                          >
+                            <Plus className="h-3.5 w-3.5 text-amber-300" />
+                            <span>Añadir {clusterVerification.missingInConfig.length} cluster(s) a la configuración</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {clusterVerification.missingInAsignaturas.length > 0 && (
+                        <div className="bg-amber-900/10 border border-amber-500/10 rounded-lg p-2.5">
+                          <span className="font-medium text-amber-300">
+                            ℹ️ {clusterVerification.missingInAsignaturas.length} cluster(s) de la plantilla no están presentes en las asignaturas cargadas:
+                          </span>{" "}
+                          <span className="font-mono text-[11px] text-amber-200/80">
+                            {clusterVerification.missingInAsignaturas.slice(0, 6).join(", ")}
+                            {clusterVerification.missingInAsignaturas.length > 6 ? ` (+${clusterVerification.missingInAsignaturas.length - 6} más)` : ""}
+                          </span>
+                          <p className="text-[11px] text-amber-200/60 mt-0.5">
+                            Estos coeficientes se conservan pero no se aplicarán a ninguna asignatura en esta ejecución.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Pestañas de Clusters Detectados + Default */}
             <div className="space-y-3">
@@ -5313,6 +5583,19 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             nombre_profesor: actualName,
           };
         })}
+      />
+
+      {/* Modal de Plantillas de Configuración de Clusters en Supabase */}
+      <ClusterConfigModal
+        isOpen={isClusterConfigModalOpen}
+        onClose={() => setIsClusterConfigModalOpen(false)}
+        initialTab={clusterConfigModalTab}
+        currentClusterColumn={clusterColumn}
+        currentClusterBetas={clusterBetas}
+        currentDefaultBetas={defaultBetas}
+        currentCustomClusters={customClusters}
+        activeAsignaturaClusters={currentActiveAsignaturaClusters}
+        onLoadConfiguration={handleLoadConfiguration}
       />
     </div>
   );

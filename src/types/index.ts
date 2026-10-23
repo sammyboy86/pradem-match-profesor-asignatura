@@ -87,6 +87,28 @@ export interface ClusterBetasConfig {
   defaultBetas: Record<string, number>;          // { pairIdOrFieldName: weightInPercent } para asignaturas sin cluster
 }
 
+export interface SavedClusterConfiguration {
+  id?: number | string;
+  name: string;
+  description?: string;
+  clusterColumn: string;
+  clusterBetas: Record<string, Record<string, number>>;
+  defaultBetas: Record<string, number>;
+  customClusters?: string[];
+  created_at?: string;
+  updated_at?: string;
+  author?: string;
+}
+
+export interface ClusterVerificationResult {
+  isValid: boolean;
+  matchingClusters: string[];
+  missingInAsignaturas: string[];
+  missingInConfig: string[];
+  totalConfigured: number;
+  totalInAsignaturas: number;
+}
+
 export type ProfessorImportMode = "generate" | "only_match";
 
 export interface MatchResultItem {
