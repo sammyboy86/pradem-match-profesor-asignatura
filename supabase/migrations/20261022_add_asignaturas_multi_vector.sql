@@ -8,10 +8,11 @@
 ALTER TABLE public.asignaturas 
 ADD COLUMN IF NOT EXISTS vectors JSONB DEFAULT '{}'::jsonb;
 
--- 2. Índice GIN para búsquedas y consultas rápidas sobre vectors
-CREATE INDEX IF NOT EXISTS idx_asignaturas_vectors_gin 
-ON public.asignaturas 
-USING gin (vectors);
+-- 2. NOTA DE RENDIMIENTO:
+-- No se crea índice GIN sobre la columna 'vectors' (JSONB). Al contener arrays numéricos
+-- de 768 flotantes, los índices GIN sufren de una amplificación extrema de escritura
+-- que causa 'canceling statement due to statement timeout' durante inserciones masivas.
+-- DROP INDEX IF EXISTS public.idx_asignaturas_vectors_gin;
 
 -- 3. Notificación de esquema listo
 COMMENT ON COLUMN public.asignaturas.vectors IS 'Almacena múltiples vectores nombrados (ej: vector_temario, vector_objetivos, etc.)';

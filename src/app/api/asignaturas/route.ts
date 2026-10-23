@@ -5,6 +5,11 @@ import { parseEmbeddingValue } from "@/lib/utils";
 
 export const maxDuration = 60;
 
+// Cache en memoria para esquema de columnas de asignaturas (TTL 60 segundos)
+let cachedTableColumns: Set<string> | null = null;
+let lastTableColumnsFetch = 0;
+const COLUMNS_CACHE_TTL = 60_000;
+
 /**
  * GET /api/asignaturas: Obtiene el listado y métricas de la tabla asignaturas
  */
@@ -176,29 +181,38 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Columnas base del esquema public.asignaturas
-    const tableColumns = new Set([
-      "clave",
-      "nombre",
-      "cluster",
-      "fines_de_aprendizaje_o_formacion",
-      "contenido_tematico",
-      "actividades_de_aprendizaje",
-      "match_nombre",
-      "match_semantico",
-      "dot_product_match",
-      "embedding_768",
-      "vectors",
-    ]);
+    // Columnas base del esquema public.asignaturas (con cache en memoria para evitar consultas redundantes)
+    const now = Date.now();
+    let tableColumns: Set<string>;
 
-    // Consultar dinámicamente si la tabla tiene más columnas en Supabase
-    try {
-      const { data: sampleRow } = await supabase.from("asignaturas").select("*").limit(1);
-      if (sampleRow && sampleRow.length > 0) {
-        Object.keys(sampleRow[0]).forEach((c) => tableColumns.add(c.toLowerCase()));
+    if (cachedTableColumns && now - lastTableColumnsFetch < COLUMNS_CACHE_TTL) {
+      tableColumns = new Set(cachedTableColumns);
+    } else {
+      tableColumns = new Set([
+        "clave",
+        "nombre",
+        "cluster",
+        "fines_de_aprendizaje_o_formacion",
+        "contenido_tematico",
+        "actividades_de_aprendizaje",
+        "match_nombre",
+        "match_semantico",
+        "dot_product_match",
+        "embedding_768",
+        "vectors",
+      ]);
+
+      // Consultar dinámicamente si la tabla tiene más columnas en Supabase
+      try {
+        const { data: sampleRow } = await supabase.from("asignaturas").select("*").limit(1);
+        if (sampleRow && sampleRow.length > 0) {
+          Object.keys(sampleRow[0]).forEach((c) => tableColumns.add(c.toLowerCase()));
+        }
+        cachedTableColumns = new Set(tableColumns);
+        lastTableColumnsFetch = now;
+      } catch {
+        // Ignorar si la tabla está vacía
       }
-    } catch {
-      // Ignorar si la tabla está vacía
     }
 
     // Detectar si hay nuevas columnas en las asignaturas que no están en tableColumns
@@ -238,6 +252,7 @@ export async function POST(req: NextRequest) {
           });
           if (!rpcErr) {
             tableColumns.add(col);
+            if (cachedTableColumns) cachedTableColumns.add(col);
           }
         } catch {
           // Ignorar si el RPC no está disponible
@@ -370,63 +385,145 @@ export async function POST(req: NextRequest) {
       return item;
     });
 
-    let result;
-    const executeSave = async (dataPayload: any[]) => {
-      // Si explícitamente se solicita upsert y los registros cuentan con 'id' de base de datos
+    // Inserción en micro-lotes para evitar statement timeout en Supabase (código 57014)
+    const MICRO_BATCH_SIZE = 10;
+
+    const executeSaveSlice = async (dataPayload: any[]) => {
+      let res;
       if (mode === "upsert") {
         const hasIds = dataPayload.some((item) => item.id != null);
         if (hasIds) {
-          return await supabase
+          res = await supabase
             .from("asignaturas")
             .upsert(dataPayload, { onConflict: "id" })
             .select("id, clave, nombre");
+        } else {
+          res = await supabase
+            .from("asignaturas")
+            .insert(dataPayload)
+            .select("id, clave, nombre");
+        }
+      } else {
+        res = await supabase
+          .from("asignaturas")
+          .insert(dataPayload)
+          .select("id, clave, nombre");
+      }
+
+      // Si falló debido a columnas inexistentes (código 42703 o "does not exist"), reintentar retirando la columna causante
+      let retryPayload = [...dataPayload];
+      let maxRetries = 5;
+      while (
+        res.error &&
+        (res.error.code === "42703" || res.error.message?.includes("does not exist")) &&
+        maxRetries > 0
+      ) {
+        maxRetries--;
+        const colMatch =
+          res.error.message.match(/column "?([a-zA-Z0-9_]+)"? of relation/i) ||
+          res.error.message.match(/column "?([a-zA-Z0-9_]+)"? does not exist/i);
+        const badCol = colMatch
+          ? colMatch[1].toLowerCase()
+          : res.error.message.includes("vectors")
+          ? "vectors"
+          : null;
+
+        if (badCol) {
+          console.warn(`Columna '${badCol}' no existe en Supabase. Reintentando guardado sin esta columna...`);
+          retryPayload = retryPayload.map((p) => {
+            const copy = { ...p };
+            delete copy[badCol];
+            return copy;
+          });
+          if (mode === "upsert" && retryPayload.some((item) => item.id != null)) {
+            res = await supabase
+              .from("asignaturas")
+              .upsert(retryPayload, { onConflict: "id" })
+              .select("id, clave, nombre");
+          } else {
+            res = await supabase
+              .from("asignaturas")
+              .insert(retryPayload)
+              .select("id, clave, nombre");
+          }
+        } else {
+          break;
         }
       }
 
-      // Por defecto para carga de asignaturas: insertar como nuevo registro (permite claves repetidas)
-      return await supabase
-        .from("asignaturas")
-        .insert(dataPayload)
-        .select("id, clave, nombre");
+      return res;
     };
 
-    result = await executeSave(payload);
+    // Función adaptativa que divide el micro-lote si PostgreSQL arroja 'statement timeout' (código 57014)
+    const saveAdaptiveBatch = async (
+      dataPayload: any[],
+      chunkSize: number
+    ): Promise<{ data: any[]; error?: any }> => {
+      const allSaved: any[] = [];
 
-    // Si falló debido a columnas inexistentes (código 42703 o mensaje "does not exist"), reintentar retirando la columna causante
-    let retryPayload = [...payload];
-    let maxRetries = 5;
-    while (result.error && (result.error.code === "42703" || result.error.message?.includes("does not exist")) && maxRetries > 0) {
-      maxRetries--;
-      const colMatch =
-        result.error.message.match(/column "?([a-zA-Z0-9_]+)"? of relation/i) ||
-        result.error.message.match(/column "?([a-zA-Z0-9_]+)"? does not exist/i);
-      const badCol = colMatch ? colMatch[1].toLowerCase() : (result.error.message.includes("vectors") ? "vectors" : null);
+      for (let i = 0; i < dataPayload.length; i += chunkSize) {
+        const slice = dataPayload.slice(i, i + chunkSize);
+        let res = await executeSaveSlice(slice);
 
-      if (badCol) {
-        console.warn(`Columna '${badCol}' no existe en Supabase. Reintentando guardado sin esta columna...`);
-        retryPayload = retryPayload.map((p) => {
-          const copy = { ...p };
-          delete copy[badCol];
-          return copy;
-        });
-        result = await executeSave(retryPayload);
-      } else {
-        break;
+        const isTimeout =
+          res.error &&
+          (res.error.code === "57014" ||
+            res.error.message?.toLowerCase().includes("statement timeout") ||
+            res.error.message?.toLowerCase().includes("canceling statement"));
+
+        if (isTimeout) {
+          if (slice.length > 2) {
+            const smallerChunk = Math.max(1, Math.floor(slice.length / 2));
+            console.warn(
+              `Statement timeout con micro-lote de ${slice.length}. Dividiendo en sub-lotes de ${smallerChunk}...`
+            );
+            const subRes = await saveAdaptiveBatch(slice, smallerChunk);
+            if (subRes.error) {
+              return { data: allSaved, error: subRes.error };
+            }
+            allSaved.push(...subRes.data);
+            continue;
+          } else if (slice.length === 2) {
+            console.warn("Statement timeout con micro-lote de 2. Guardando fila por fila...");
+            const subRes = await saveAdaptiveBatch(slice, 1);
+            if (subRes.error) {
+              return { data: allSaved, error: subRes.error };
+            }
+            allSaved.push(...subRes.data);
+            continue;
+          }
+        }
+
+        if (res.error) {
+          return { data: allSaved, error: res.error };
+        }
+
+        if (res.data) {
+          allSaved.push(...res.data);
+        }
       }
-    }
 
-    if (result.error) {
-      console.error("Error al guardar asignaturas:", result.error);
+      return { data: allSaved };
+    };
+
+    const saveResult = await saveAdaptiveBatch(payload, MICRO_BATCH_SIZE);
+
+    if (saveResult.error) {
+      console.error("Error al guardar asignaturas:", saveResult.error);
       return NextResponse.json(
-        { success: false, error: `Error en Supabase: ${result.error.message}` },
+        {
+          success: false,
+          error: `Error en Supabase: ${saveResult.error.message}`,
+          insertedCount: saveResult.data.length,
+        },
         { status: 500 }
       );
     }
 
     return NextResponse.json({
       success: true,
-      count: result.data?.length || payload.length,
-      data: result.data,
+      count: saveResult.data.length || payload.length,
+      data: saveResult.data,
     });
   } catch (error: any) {
     console.error("Error en POST /api/asignaturas:", error);

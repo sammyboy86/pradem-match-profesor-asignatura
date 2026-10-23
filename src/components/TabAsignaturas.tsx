@@ -639,36 +639,77 @@ export default function TabAsignaturas({
         throw new Error("No se encontraron filas con el nombre de asignatura especificado.");
       }
 
-      // Guardar directamente en Supabase vía /api/asignaturas en lotes de 50
+      // Guardar directamente en Supabase vía /api/asignaturas en lotes de tamaño optimizado
       setStatusMessage(
         `Guardando ${validRows.length} registros en Supabase (${parsedEmbeddingsCount} vectores procesados)...`
       );
       setUploadProgress(25);
 
-      const DB_BATCH_SIZE = 50;
+      // Tamaño de lote dinámico: 15 si incluye columnas vectoriales para evitar timeouts en Supabase, o 25 si es solo texto
+      const DB_BATCH_SIZE = selectedVectorColumns.length > 0 ? 15 : 25;
       const totalDbBatches = Math.ceil(validRows.length / DB_BATCH_SIZE);
       let totalInserted = 0;
 
+      // Subida con reintento automático y división de lote ante posibles timeouts
+      const uploadBatchWithRetry = async (
+        slice: Asignatura[],
+        batchNum: number,
+        retries = 2
+      ): Promise<number> => {
+        try {
+          const res = await apiFetch<{
+            success: boolean;
+            count: number;
+            error?: string;
+            insertedCount?: number;
+          }>("/api/asignaturas", {
+            method: "POST",
+            body: JSON.stringify({
+              asignaturas: slice,
+              mode: upsertMode,
+            }),
+          });
+
+          if (!res.success) {
+            throw new Error(res.error || `Error al guardar lote ${batchNum} en Supabase`);
+          }
+
+          return res.count || slice.length;
+        } catch (err: any) {
+          const isTimeout =
+            err.message?.toLowerCase().includes("statement timeout") ||
+            err.message?.toLowerCase().includes("canceling statement") ||
+            err.message?.includes("57014");
+
+          // Si es timeout y el lote tiene más de 4 registros, dividir en mitades
+          if (isTimeout && slice.length > 4) {
+            console.warn(
+              `Lote ${batchNum} (${slice.length} filas) arrojó timeout. Dividiendo en sub-lotes...`
+            );
+            const mid = Math.floor(slice.length / 2);
+            const count1 = await uploadBatchWithRetry(slice.slice(0, mid), batchNum, 1);
+            const count2 = await uploadBatchWithRetry(slice.slice(mid), batchNum, 1);
+            return count1 + count2;
+          }
+
+          if (retries > 0) {
+            console.warn(`Reintentando lote ${batchNum} tras error:`, err.message);
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            return await uploadBatchWithRetry(slice, batchNum, retries - 1);
+          }
+
+          throw err;
+        }
+      };
+
       for (let i = 0; i < totalDbBatches; i++) {
         const batchSlice = validRows.slice(i * DB_BATCH_SIZE, (i + 1) * DB_BATCH_SIZE);
+        setStatusMessage(
+          `Guardando lote ${i + 1} de ${totalDbBatches} (${totalInserted}/${validRows.length} guardadas)...`
+        );
 
-        const res = await apiFetch<{
-          success: boolean;
-          count: number;
-          error?: string;
-        }>("/api/asignaturas", {
-          method: "POST",
-          body: JSON.stringify({
-            asignaturas: batchSlice,
-            mode: upsertMode,
-          }),
-        });
-
-        if (!res.success) {
-          throw new Error(res.error || `Error al guardar lote ${i + 1} en Supabase`);
-        }
-
-        totalInserted += res.count || batchSlice.length;
+        const count = await uploadBatchWithRetry(batchSlice, i + 1);
+        totalInserted += count;
         setUploadProgress(25 + Math.round(((i + 1) / totalDbBatches) * 75));
       }
 
@@ -702,12 +743,33 @@ export default function TabAsignaturas({
       if (onDatabaseUpdated) onDatabaseUpdated();
     } catch (err: any) {
       console.error("Error al cargar a Supabase:", err);
-      setStatusMessage(`Error: ${err.message || "Fallo en el proceso"}`);
+      const isTimeout =
+        err.message?.toLowerCase().includes("statement timeout") ||
+        err.message?.toLowerCase().includes("canceling statement") ||
+        err.message?.includes("57014");
+
+      const errorMessage = isTimeout
+        ? `Error: Supabase canceló la operación por límite de tiempo (statement timeout). Se guardaron ${totalInserted} de ${fileRows.length} asignaturas.`
+        : `Error: ${err.message || "Fallo en el proceso"}`;
+
+      setStatusMessage(errorMessage);
+
+      const errorList = [err.message || "Error desconocido al procesar asignaturas"];
+      if (isTimeout) {
+        errorList.push(
+          "Sugerencia: Para archivos grandes con vectores, ejecuta la migración 'supabase/migrations/20261023_optimize_asignaturas_indices.sql' en el SQL Editor de Supabase para remover el índice GIN innecesario."
+        );
+      }
+
       setUploadReport({
         total: fileRows.length,
-        success: 0,
-        errors: [err.message || "Error desconocido al procesar asignaturas"],
+        success: totalInserted,
+        errors: errorList,
       });
+
+      // Refrescar registros guardados hasta el momento
+      await loadDatabaseRecords();
+      if (onDatabaseUpdated) onDatabaseUpdated();
     } finally {
       setIsUploading(false);
     }
@@ -1596,19 +1658,66 @@ export default function TabAsignaturas({
 
             {/* Reporte de Carga */}
             {uploadReport && (
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-xs space-y-2">
-                <div className="flex items-center gap-2 font-bold text-emerald-300">
-                  <CheckCircle2 className="h-4 w-4" />
-                  <span>Reporte de Operación:</span>
+              <div
+                className={`rounded-xl border p-4 text-xs space-y-2 ${
+                  uploadReport.success === 0
+                    ? "border-rose-500/30 bg-rose-500/10"
+                    : uploadReport.success < uploadReport.total
+                    ? "border-amber-500/30 bg-amber-500/10"
+                    : "border-emerald-500/30 bg-emerald-500/10"
+                }`}
+              >
+                <div
+                  className={`flex items-center gap-2 font-bold ${
+                    uploadReport.success === 0
+                      ? "text-rose-300"
+                      : uploadReport.success < uploadReport.total
+                      ? "text-amber-300"
+                      : "text-emerald-300"
+                  }`}
+                >
+                  {uploadReport.success === 0 ? (
+                    <AlertCircle className="h-4 w-4 text-rose-400" />
+                  ) : uploadReport.success < uploadReport.total ? (
+                    <AlertCircle className="h-4 w-4 text-amber-400" />
+                  ) : (
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                  )}
+                  <span>
+                    {uploadReport.success === 0
+                      ? "Fallo en la Operación:"
+                      : uploadReport.success < uploadReport.total
+                      ? "Reporte de Carga Parcial:"
+                      : "Reporte de Operación:"}
+                  </span>
                 </div>
                 <p className="text-slate-300">
-                  Se insertaron exitosamente <strong className="text-white">{uploadReport.success}</strong> de{" "}
-                  <strong>{uploadReport.total}</strong> asignaturas en Supabase.
+                  Se insertaron exitosamente{" "}
+                  <strong
+                    className={
+                      uploadReport.success === 0
+                        ? "text-rose-400"
+                        : uploadReport.success < uploadReport.total
+                        ? "text-amber-300 font-bold"
+                        : "text-white font-bold"
+                    }
+                  >
+                    {uploadReport.success}
+                  </strong>{" "}
+                  de <strong>{uploadReport.total}</strong> asignaturas en Supabase.
                 </p>
                 {uploadReport.errors.length > 0 && (
-                  <div className="mt-2 text-rose-300 text-[11px] space-y-1">
-                    <p className="font-semibold">Filas descartadas u observaciones:</p>
-                    <ul className="list-disc pl-5 max-h-24 overflow-y-auto">
+                  <div
+                    className={`mt-2 text-[11px] space-y-1 ${
+                      uploadReport.success === 0 ? "text-rose-300" : "text-amber-200/90"
+                    }`}
+                  >
+                    <p className="font-semibold">
+                      {uploadReport.success === 0
+                        ? "Detalles del error:"
+                        : "Filas descartadas u observaciones:"}
+                    </p>
+                    <ul className="list-disc pl-5 max-h-32 overflow-y-auto space-y-0.5">
                       {uploadReport.errors.map((e, idx) => (
                         <li key={idx}>{e}</li>
                       ))}
