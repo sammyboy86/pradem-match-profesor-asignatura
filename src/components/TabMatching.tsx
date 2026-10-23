@@ -41,6 +41,7 @@ import {
   Link2,
   SlidersHorizontal,
   Table,
+  Database,
 } from "lucide-react";
 import {
   Profesor,
@@ -175,6 +176,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [defaultBetas, setDefaultBetas] = useState<Record<string, number>>({});
   const [newClusterName, setNewClusterName] = useState<string>("");
   const [isLoadingClusters, setIsLoadingClusters] = useState<boolean>(false);
+  const [isSyncingWithDb, setIsSyncingWithDb] = useState<boolean>(false);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
   // ── Configuración de Pares de Distancia Multi-Vector (Profesor ↔ Asignatura) ──
   const [availableAsigVectorCols, setAvailableAsigVectorCols] = useState<string[]>(["embedding_768"]);
@@ -338,55 +342,143 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     }
   }, [effectiveCatalogCount, topK]);
 
-  // ── Cargar Clusters Disponibles desde Supabase o Filtro ──
+  // ── Cargar Clusters y Metadatos Disponibles desde Supabase o Filtro ──
   const loadAvailableClusters = useCallback(async (colName: string) => {
     setIsLoadingClusters(true);
     try {
-      if (isFilterActive && filteredAsignaturas.length > 0) {
-        // Extraer de las asignaturas filtradas
-        const clustersSet = new Set<string>();
-        const vectorColsSet = new Set<string>(["embedding_768"]);
-        filteredAsignaturas.forEach((a) => {
-          const val = (a as any)[colName] || a.cluster;
-          if (val && String(val).trim()) {
-            clustersSet.add(String(val).trim());
-          }
-          if (Array.isArray(a.vectorColumns)) {
-            a.vectorColumns.forEach((c) => vectorColsSet.add(c));
-          }
-          if (a.vectors && typeof a.vectors === "object") {
-            Object.keys(a.vectors).forEach((k) => vectorColsSet.add(k));
-          }
-        });
-        setDetectedClusters(Array.from(clustersSet).sort());
-        setAvailableAsigVectorCols(Array.from(vectorColsSet));
-      } else {
-        // Consultar el endpoint de clusters
-        const data = await apiFetch<{
-          success: boolean;
-          availableColumns: string[];
-          clusters: string[];
-          availableVectorColumns?: string[];
-        }>(`/api/asignaturas/clusters?column=${encodeURIComponent(colName)}`);
+      // Siempre consultar las columnas disponibles, clusters de catálogo y el total de asignaturas desde Supabase
+      const data = await apiFetch<{
+        success: boolean;
+        availableColumns: string[];
+        clusters: string[];
+        availableVectorColumns?: string[];
+        totalCatalogCount?: number;
+      }>(`/api/asignaturas/clusters?column=${encodeURIComponent(colName)}`);
 
-        if (data.success) {
-          if (Array.isArray(data.availableColumns) && data.availableColumns.length > 0) {
-            setAvailableClusterColumns(data.availableColumns);
-          }
+      if (data.success) {
+        if (Array.isArray(data.availableColumns) && data.availableColumns.length > 0) {
+          setAvailableClusterColumns(data.availableColumns);
+        }
+        if (typeof data.totalCatalogCount === "number" && data.totalCatalogCount > 0) {
+          setTotalCatalogCount(data.totalCatalogCount);
+        }
+        if (Array.isArray(data.availableVectorColumns) && data.availableVectorColumns.length > 0) {
+          setAvailableAsigVectorCols(data.availableVectorColumns);
+        }
+
+        if (isFilterActive && filteredAsignaturas.length > 0) {
+          // Extraer de las asignaturas filtradas para colName
+          const clustersSet = new Set<string>();
+          filteredAsignaturas.forEach((a) => {
+            const val = (a as any)[colName] || a.cluster;
+            if (val && String(val).trim()) {
+              clustersSet.add(String(val).trim());
+            }
+          });
+          setDetectedClusters(Array.from(clustersSet).sort());
+        } else {
+          // Catálogo completo directo de Supabase
           if (Array.isArray(data.clusters)) {
             setDetectedClusters(data.clusters);
           }
-          if (Array.isArray(data.availableVectorColumns) && data.availableVectorColumns.length > 0) {
-            setAvailableAsigVectorCols(data.availableVectorColumns);
-          }
         }
+        setLastSyncTime(new Date());
       }
     } catch (err) {
-      console.warn("No se pudieron cargar clusters:", err);
+      console.warn("No se pudieron cargar clusters de Supabase:", err);
     } finally {
       setIsLoadingClusters(false);
     }
   }, [isFilterActive, filteredAsignaturas]);
+
+  // ── Sincronizar Asignaturas y Clusters Actualizados directamente de Supabase ──
+  const syncCatalogAndClusters = useCallback(
+    async (overrideClusterCol?: string) => {
+      setIsSyncingWithDb(true);
+      const colToUse = overrideClusterCol || clusterColumn;
+      try {
+        let currentFiltered = filteredAsignaturas;
+
+        // 1. Si hay archivo de filtro activo y columna de claves definida, re-filtrar contra Supabase para traer datos actualizados
+        if (filterRows.length > 0 && filterKeyColumn) {
+          setIsLoadingFilterMatches(true);
+          const cleaned = filterRows
+            .map((r) => cleanClave(r[filterKeyColumn]))
+            .filter((k) => k.length > 0);
+          const unique = Array.from(new Set(cleaned));
+          setUniqueCleanedClaves(unique);
+
+          if (unique.length > 0) {
+            const res = await apiFetch<FilterClavesResponse>("/api/asignaturas/filter-claves", {
+              method: "POST",
+              body: JSON.stringify({ claves: unique, clusterColumn: colToUse }),
+            });
+
+            if (res.success) {
+              currentFiltered = res.matchedAsignaturas || [];
+              setFilteredAsignaturas(currentFiltered);
+              setUnmatchedClaves(res.unmatchedClaves || []);
+              setIsFilterActive(true);
+
+              if (typeof res.totalCatalogCount === "number" && res.totalCatalogCount > 0) {
+                setTotalCatalogCount(res.totalCatalogCount);
+              }
+              if (Array.isArray(res.availableColumns) && res.availableColumns.length > 0) {
+                setAvailableClusterColumns(res.availableColumns);
+              }
+              if (Array.isArray(res.availableVectorColumns) && res.availableVectorColumns.length > 0) {
+                setAvailableAsigVectorCols(res.availableVectorColumns);
+              }
+            }
+          }
+          setIsLoadingFilterMatches(false);
+        }
+
+        // 2. Consultar clusters y metadatos actualizados de Supabase
+        const clusterRes = await apiFetch<{
+          success: boolean;
+          availableColumns: string[];
+          clusters: string[];
+          availableVectorColumns?: string[];
+          totalCatalogCount?: number;
+        }>(`/api/asignaturas/clusters?column=${encodeURIComponent(colToUse)}`);
+
+        if (clusterRes.success) {
+          if (Array.isArray(clusterRes.availableColumns) && clusterRes.availableColumns.length > 0) {
+            setAvailableClusterColumns(clusterRes.availableColumns);
+          }
+          if (typeof clusterRes.totalCatalogCount === "number" && clusterRes.totalCatalogCount > 0) {
+            setTotalCatalogCount(clusterRes.totalCatalogCount);
+          }
+          if (Array.isArray(clusterRes.availableVectorColumns) && clusterRes.availableVectorColumns.length > 0) {
+            setAvailableAsigVectorCols(clusterRes.availableVectorColumns);
+          }
+
+          if (isFilterActive && currentFiltered.length > 0) {
+            const clustersSet = new Set<string>();
+            currentFiltered.forEach((a) => {
+              const val = (a as any)[colToUse] || a.cluster;
+              if (val && String(val).trim()) clustersSet.add(String(val).trim());
+            });
+            setDetectedClusters(Array.from(clustersSet).sort());
+          } else if (Array.isArray(clusterRes.clusters)) {
+            setDetectedClusters(clusterRes.clusters);
+          }
+        }
+
+        setLastSyncTime(new Date());
+        const count = isFilterActive && currentFiltered.length > 0 ? currentFiltered.length : (clusterRes.totalCatalogCount || totalCatalogCount);
+        setSyncNotice(`Catálogo sincronizado con Supabase (${count} asignaturas activas).`);
+        setTimeout(() => setSyncNotice(null), 4000);
+      } catch (err: any) {
+        console.warn("Error al sincronizar con Supabase:", err);
+      } finally {
+        setIsSyncingWithDb(false);
+        setIsLoadingFilterMatches(false);
+      }
+    },
+    [clusterColumn, filterRows, filterKeyColumn, filteredAsignaturas, isFilterActive, totalCatalogCount]
+  );
 
   useEffect(() => {
     loadAvailableClusters(clusterColumn);
@@ -695,8 +787,12 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     };
   }, [importMode, fileRows, queryConfigs]);
 
-  // ── Procesamiento de Filtro de Claves (Limpieza Preliminar + Consulta) ──
-  const processFilterColumn = async (rows: Record<string, string>[], colName: string) => {
+  // ── Procesamiento de Filtro de Claves (Limpieza Preliminar + Consulta a Supabase) ──
+  const processFilterColumn = async (
+    rows: Record<string, string>[],
+    colName: string,
+    targetClusterCol?: string
+  ) => {
     if (!rows.length || !colName) {
       setFilteredAsignaturas([]);
       setUnmatchedClaves([]);
@@ -706,6 +802,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
     setFilterError(null);
     setIsLoadingFilterMatches(true);
+    const clusterColToQuery = targetClusterCol || clusterColumn;
 
     try {
       // Limpieza preliminar: quitar caracteres no alfa-numéricos y pasar a mayúsculas
@@ -723,28 +820,51 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         return;
       }
 
-      // Consultar endpoint para validar contra catálogo de asignaturas en Supabase
+      // Consultar endpoint para validar y traer datos actualizados contra catálogo de asignaturas en Supabase
       const res = await apiFetch<FilterClavesResponse>("/api/asignaturas/filter-claves", {
         method: "POST",
-        body: JSON.stringify({ claves: unique }),
+        body: JSON.stringify({ claves: unique, clusterColumn: clusterColToQuery }),
       });
 
       if (res.success) {
-        setFilteredAsignaturas(res.matchedAsignaturas || []);
+        const matched = res.matchedAsignaturas || [];
+        setFilteredAsignaturas(matched);
         setUnmatchedClaves(res.unmatchedClaves || []);
         setIsFilterActive(true);
-        if (res.matchedAsignaturas && res.matchedAsignaturas.length > 0) {
-          const vectorColsSet = new Set<string>(["embedding_768"]);
-          res.matchedAsignaturas.forEach((a) => {
-            if (Array.isArray(a.vectorColumns)) {
-              a.vectorColumns.forEach((c) => vectorColsSet.add(c));
-            }
-            if (a.vectors && typeof a.vectors === "object") {
-              Object.keys(a.vectors).forEach((k) => vectorColsSet.add(k));
-            }
-          });
-          setAvailableAsigVectorCols(Array.from(vectorColsSet));
+
+        if (typeof res.totalCatalogCount === "number" && res.totalCatalogCount > 0) {
+          setTotalCatalogCount(res.totalCatalogCount);
         }
+        if (Array.isArray(res.availableColumns) && res.availableColumns.length > 0) {
+          setAvailableClusterColumns(res.availableColumns);
+        }
+
+        const vectorColsSet = new Set<string>(["embedding_768"]);
+        matched.forEach((a) => {
+          if (Array.isArray(a.vectorColumns)) {
+            a.vectorColumns.forEach((c) => vectorColsSet.add(c));
+          }
+          if (a.vectors && typeof a.vectors === "object") {
+            Object.keys(a.vectors).forEach((k) => vectorColsSet.add(k));
+          }
+        });
+        if (Array.isArray(res.availableVectorColumns)) {
+          res.availableVectorColumns.forEach((c) => vectorColsSet.add(c));
+        }
+        setAvailableAsigVectorCols(Array.from(vectorColsSet));
+
+        // Actualizar clusters detectados a partir de las asignaturas filtradas recién obtenidas de Supabase
+        const clustersSet = new Set<string>();
+        matched.forEach((a) => {
+          const val = (a as any)[clusterColToQuery] || a.cluster;
+          if (val && String(val).trim()) {
+            clustersSet.add(String(val).trim());
+          }
+        });
+        setDetectedClusters(Array.from(clustersSet).sort());
+        setLastSyncTime(new Date());
+        setSyncNotice(`Filtro sincronizado con Supabase: ${matched.length} asignaturas encontradas.`);
+        setTimeout(() => setSyncNotice(null), 4000);
       } else {
         setFilterError(res.error || "Error al buscar asignaturas por claves en el catálogo.");
       }
@@ -787,6 +907,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         }) || headers[0] || "";
 
       setFilterKeyColumn(detected);
+      // ¡IMPORTANTE! Consultar y traer las asignaturas actualizadas de Supabase
       await processFilterColumn(rows, detected);
     } catch (err: any) {
       alert(err.message || "Error al procesar archivo de claves");
@@ -817,6 +938,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     if (filterFileInputRef.current) {
       filterFileInputRef.current.value = "";
     }
+    // Al limpiar filtro, recargar clusters completos desde Supabase
+    loadAvailableClusters(clusterColumn);
   };
 
   // ── Inicializar Configuraciones de Query al Cargar Archivo ──
@@ -922,6 +1045,9 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
 
       setNameColumn(detectedName);
       setupQueryConfigs(headers, detectedName, detectedId);
+
+      // ¡IMPORTANTE! Al iniciar el proceso subiendo profesores, sincronizar y traer las asignaturas más recientes de Supabase
+      await syncCatalogAndClusters();
     } catch (err: any) {
       alert(err.message || "Error al procesar archivo de profesores");
       setFile(null);
@@ -2365,8 +2491,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             </div>
           </div>
 
-          {/* Badge de Estado del Filtro */}
-          <div className="flex items-center gap-2">
+          {/* Badge de Estado del Filtro y Botón Sincronizar Supabase */}
+          <div className="flex flex-wrap items-center gap-2">
             {!filterFile ? (
               <span className="rounded-xl border border-white/10 bg-slate-800/80 px-3 py-1.5 text-xs text-slate-400 flex items-center gap-1.5">
                 <span className="h-2 w-2 rounded-full bg-slate-400" />
@@ -2381,7 +2507,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <button
                   type="button"
                   onClick={() => setIsFilterActive(!isFilterActive)}
-                  className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-white/10 transition"
+                  className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-white/10 transition cursor-pointer"
                   title="Pausar o reactivar el filtro de claves"
                 >
                   Pausar
@@ -2396,14 +2522,39 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <button
                   type="button"
                   onClick={() => setIsFilterActive(true)}
-                  className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/20 transition font-semibold"
+                  className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/20 transition font-semibold cursor-pointer"
                 >
                   Reactivar
                 </button>
               </div>
             )}
+
+            {/* Botón para forzar sincronización con Supabase */}
+            <button
+              type="button"
+              onClick={() => syncCatalogAndClusters()}
+              disabled={isSyncingWithDb}
+              className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 px-3 py-1.5 text-xs font-semibold text-cyan-300 flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+              title="Sincronizar catálogo y clusters actualizados desde Supabase"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isSyncingWithDb ? "animate-spin text-cyan-400" : ""}`} />
+              <span>{isSyncingWithDb ? "Sincronizando..." : "Sincronizar Catálogo BD"}</span>
+            </button>
           </div>
         </div>
+
+        {/* Notificación de sincronización con Supabase */}
+        {syncNotice && (
+          <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-xs font-medium text-emerald-300 animate-in fade-in">
+            <CheckCircle2 className="h-4 w-4 text-emerald-400 flex-shrink-0" />
+            <span>{syncNotice}</span>
+            {lastSyncTime && (
+              <span className="text-[10px] text-emerald-400/70 font-mono ml-auto">
+                {lastSyncTime.toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Zona Drag & Drop si no hay archivo de filtro */}
         {!filterFile ? (
@@ -2654,6 +2805,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                             <th className="px-3 py-2 font-mono text-cyan-300">Clave Limpia</th>
                             <th className="px-3 py-2 text-slate-400">Clave Original BD</th>
                             <th className="px-3 py-2 font-bold text-white">Nombre de Asignatura</th>
+                            <th className="px-3 py-2 text-cyan-300">Cluster BD ({clusterColumn})</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-white/5 text-slate-300">
@@ -2670,6 +2822,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                               </td>
                               <td className="px-3 py-1.5 font-medium text-white">
                                 {asig.nombre}
+                              </td>
+                              <td className="px-3 py-1.5 font-medium text-cyan-300 text-[11px]">
+                                {(asig as any)[clusterColumn] || asig.cluster || (
+                                  <span className="text-slate-500 italic">Sin cluster</span>
+                                )}
                               </td>
                             </tr>
                           ))}
@@ -3338,7 +3495,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                 <span className="text-slate-400 font-medium">Columna de Cluster:</span>
                 <select
                   value={clusterColumn}
-                  onChange={(e) => setClusterColumn(e.target.value)}
+                  onChange={(e) => {
+                    const newCol = e.target.value;
+                    setClusterColumn(newCol);
+                    syncCatalogAndClusters(newCol);
+                  }}
                   className="rounded-lg border border-white/15 bg-slate-950 px-2.5 py-1 text-xs text-cyan-300 font-semibold focus:outline-none focus:ring-1 focus:ring-cyan-500"
                 >
                   {availableClusterColumns.map((col) => (
@@ -3347,7 +3508,19 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     </option>
                   ))}
                 </select>
-                {isLoadingClusters && <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />}
+                <button
+                  type="button"
+                  onClick={() => syncCatalogAndClusters()}
+                  disabled={isSyncingWithDb || isLoadingClusters}
+                  className="p-1 rounded-md hover:bg-white/10 text-cyan-400 transition cursor-pointer"
+                  title="Recargar clusters y asignaturas desde Supabase"
+                >
+                  <RefreshCw
+                    className={`h-3 w-3 ${
+                      isSyncingWithDb || isLoadingClusters ? "animate-spin text-cyan-400" : ""
+                    }`}
+                  />
+                </button>
               </div>
             </div>
 

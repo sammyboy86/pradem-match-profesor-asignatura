@@ -151,6 +151,7 @@ export interface FilteredAsignatura {
   hasEmbedding?: boolean;
   vectors?: Record<string, number[]> | null;
   vectorColumns?: string[];
+  [key: string]: any;
 }
 
 export interface FilterClavesResponse {
@@ -160,6 +161,9 @@ export interface FilterClavesResponse {
   matchedCount: number;
   unmatchedClaves: string[];
   totalUploadedClaves: number;
+  totalCatalogCount?: number;
+  availableColumns?: string[];
+  availableVectorColumns?: string[];
   error?: string;
 }
 

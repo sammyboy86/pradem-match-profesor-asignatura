@@ -31,7 +31,18 @@ export async function GET(req: NextRequest) {
       // Usar columnas por defecto si la tabla está vacía
     }
 
-    // 2. Consultar valores únicos de la columna de cluster objetivo
+    // 2. Obtener conteo total del catálogo
+    let totalCount = 0;
+    try {
+      const { count } = await supabase
+        .from("asignaturas")
+        .select("id", { count: "exact", head: true });
+      totalCount = count || 0;
+    } catch {
+      // Ignorar fallback
+    }
+
+    // 3. Consultar valores únicos de la columna de cluster objetivo
     let uniqueClusters: string[] = [];
 
     try {
@@ -41,7 +52,7 @@ export async function GET(req: NextRequest) {
         .from("asignaturas")
         .select(colToQuery)
         .not(colToQuery, "is", null)
-        .limit(2000);
+        .range(0, Math.max(9999, totalCount));
 
       if (!clusterErr && Array.isArray(rows)) {
         const set = new Set<string>();
@@ -102,6 +113,7 @@ export async function GET(req: NextRequest) {
       availableColumns,
       availableVectorColumns,
       clusters: uniqueClusters,
+      totalCatalogCount: totalCount,
     });
   } catch (error: any) {
     console.error("Error en GET /api/asignaturas/clusters:", error);

@@ -412,16 +412,33 @@ export async function POST(req: NextRequest) {
     }
 
     // ── FASE 1: CARGA LIGERA DE VECTORES DE ASIGNATURAS CANDIDATAS ──
-    // Se seleccionan ÚNICAMENTE las columnas vectoriales y de indexación mínimas.
+    // Se seleccionan ÚNICAMENTE las columnas vectoriales y de indexación mínimas (incluyendo la columna de cluster activa).
     // Omitir textos masivos (contenido_tematico, fines_de_aprendizaje, actividades)
     // reduce el payload en un 85% y elimina por completo el error de 'statement timeout'.
-    let selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768, vectors";
+    const cleanClusterCol = clusterColumn && /^[a-zA-Z0-9_]+$/.test(clusterColumn) ? clusterColumn : "cluster";
+    const baseCols = ["id", "clave", "nombre", "cluster", "match_nombre"];
+    if (cleanClusterCol !== "cluster" && !baseCols.includes(cleanClusterCol)) {
+      baseCols.push(cleanClusterCol);
+    }
+    let selectCols = `${baseCols.join(", ")}, embedding_768, vectors`;
     let targetRows: any[] = [];
     try {
       targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
     } catch (fetchErr: any) {
       if (fetchErr.message?.includes("vectors") || fetchErr.code === "42703") {
-        selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768";
+        selectCols = `${baseCols.join(", ")}, embedding_768`;
+        try {
+          targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
+        } catch (innerErr: any) {
+          if (cleanClusterCol !== "cluster") {
+            selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768";
+            targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
+          } else {
+            throw innerErr;
+          }
+        }
+      } else if (cleanClusterCol !== "cluster" && (fetchErr.message?.includes(cleanClusterCol) || fetchErr.code === "42703")) {
+        selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768, vectors";
         targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
       } else {
         throw new Error(`Error al consultar asignaturas en Supabase: ${fetchErr.message}`);
@@ -510,7 +527,7 @@ export async function POST(req: NextRequest) {
       }
 
       // 4. Pre-calcular pesos de cluster para cada par activo
-      const rawClusterVal = r[clusterColumn] !== undefined ? r[clusterColumn] : r.cluster;
+      const rawClusterVal = r[cleanClusterCol] !== undefined ? r[cleanClusterCol] : r.cluster;
       const cleanCluster =
         rawClusterVal != null && String(rawClusterVal).trim() !== ""
           ? String(rawClusterVal).trim()
@@ -729,6 +746,9 @@ export async function POST(req: NextRequest) {
           const full = detailsMap.get(m.asignaturaId);
           if (full) {
             Object.assign(m, full);
+            if (cleanClusterCol && full[cleanClusterCol] !== undefined && full[cleanClusterCol] !== null) {
+              m.cluster = String(full[cleanClusterCol]).trim();
+            }
           }
         });
       });
