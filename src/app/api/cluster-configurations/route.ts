@@ -113,13 +113,24 @@ export async function POST(req: NextRequest) {
       updated_at: new Date().toISOString(),
     };
 
+    const targetId =
+      body.id != null && body.id !== ""
+        ? typeof body.id === "number"
+          ? body.id
+          : !isNaN(Number(body.id))
+          ? Number(body.id)
+          : body.id
+        : null;
+
     let result;
-    if (body.id != null) {
+    const isUpdate = targetId != null;
+
+    if (isUpdate) {
       // Actualizar existente
       result = await supabase
         .from("cluster_configurations")
         .update(payload)
-        .eq("id", body.id)
+        .eq("id", targetId)
         .select()
         .single();
     } else {
@@ -149,6 +160,16 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      if (result.error.code === "PGRST116" || result.error.message?.includes("0 rows")) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `No se encontró la configuración con ID ${targetId} para actualizar en Supabase.`,
+          },
+          { status: 404 }
+        );
+      }
+
       throw result.error;
     }
 
@@ -169,7 +190,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       configuration: savedConfig,
-      message: `Configuración '${savedConfig.name}' guardada exitosamente en Supabase.`,
+      message: isUpdate
+        ? `Configuración '${savedConfig.name}' actualizada exitosamente en Supabase.`
+        : `Configuración '${savedConfig.name}' guardada exitosamente en Supabase.`,
     });
   } catch (error: any) {
     console.error("Error en POST /api/cluster-configurations:", error);

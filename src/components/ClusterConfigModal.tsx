@@ -34,7 +34,9 @@ interface ClusterConfigModalProps {
   currentDefaultBetas: Record<string, number>;
   currentCustomClusters: string[];
   activeAsignaturaClusters: string[];
+  activeLoadedConfig?: SavedClusterConfiguration | null;
   onLoadConfiguration: (config: SavedClusterConfiguration) => void;
+  onSaveConfiguration?: (config: SavedClusterConfiguration) => void;
 }
 
 export function verifyClusterConfiguration(
@@ -83,7 +85,9 @@ export default function ClusterConfigModal({
   currentDefaultBetas,
   currentCustomClusters,
   activeAsignaturaClusters,
+  activeLoadedConfig,
   onLoadConfiguration,
+  onSaveConfiguration,
 }: ClusterConfigModalProps) {
   const [activeTab, setActiveTab] = useState<"load" | "save">(initialTab);
 
@@ -95,8 +99,11 @@ export default function ClusterConfigModal({
   const [copiedSql, setCopiedSql] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [deletingId, setDeletingId] = useState<number | string | null>(null);
+  const [quickUpdatingId, setQuickUpdatingId] = useState<number | string | null>(null);
 
   // Estados de formulario para guardar
+  const [saveAction, setSaveAction] = useState<"update" | "create">("create");
+  const [selectedUpdateConfigId, setSelectedUpdateConfigId] = useState<number | string | "">("");
   const [configName, setConfigName] = useState("");
   const [configDescription, setConfigDescription] = useState("");
   const [authorName, setAuthorName] = useState("");
@@ -142,8 +149,22 @@ export default function ClusterConfigModal({
       fetchSavedConfigurations();
       setSaveSuccessMsg(null);
       setSaveErrorMsg(null);
+
+      if (activeLoadedConfig) {
+        setSaveAction("update");
+        setSelectedUpdateConfigId(activeLoadedConfig.id || "");
+        setConfigName(activeLoadedConfig.name || "");
+        setConfigDescription(activeLoadedConfig.description || "");
+        setAuthorName(activeLoadedConfig.author || "");
+      } else {
+        setSaveAction("create");
+        setSelectedUpdateConfigId("");
+        setConfigName("");
+        setConfigDescription("");
+        setAuthorName("");
+      }
     }
-  }, [isOpen, initialTab]);
+  }, [isOpen, initialTab, activeLoadedConfig]);
 
   // Lista filtrada de configuraciones
   const filteredConfigs = useMemo(() => {
@@ -158,13 +179,15 @@ export default function ClusterConfigModal({
     );
   }, [savedConfigs, searchQuery]);
 
-  // Manejo de guardado en Supabase
+  // Manejo de guardado o actualización en Supabase
   const handleSaveConfiguration = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!configName.trim()) {
       setSaveErrorMsg("Introduce un nombre representativo para la configuración.");
       return;
     }
+
+    const isUpdating = saveAction === "update" && selectedUpdateConfigId !== "";
 
     setIsSaving(true);
     setSaveErrorMsg(null);
@@ -181,6 +204,7 @@ export default function ClusterConfigModal({
       }>("/api/cluster-configurations", {
         method: "POST",
         body: JSON.stringify({
+          id: isUpdating ? selectedUpdateConfigId : undefined,
           name: configName.trim(),
           description: configDescription.trim() || undefined,
           clusterColumn: currentClusterColumn,
@@ -198,10 +222,15 @@ export default function ClusterConfigModal({
         return;
       }
 
-      if (res.success) {
-        setSaveSuccessMsg(`¡Configuración '${configName}' guardada con éxito en Supabase!`);
-        setConfigName("");
-        setConfigDescription("");
+      if (res.success && res.configuration) {
+        const saved = res.configuration;
+        const msg =
+          res.message ||
+          (isUpdating
+            ? `¡Configuración '${saved.name}' actualizada con éxito en Supabase!`
+            : `¡Configuración '${saved.name}' guardada con éxito en Supabase!`);
+        setSaveSuccessMsg(msg);
+        onSaveConfiguration?.(saved);
         await fetchSavedConfigurations();
         setTimeout(() => {
           setActiveTab("load");
@@ -217,9 +246,58 @@ export default function ClusterConfigModal({
     }
   };
 
+  // Sobrescribir una configuración existente directamente desde la lista
+  const handleQuickOverwrite = async (targetConfig: SavedClusterConfiguration) => {
+    if (
+      !window.confirm(
+        `¿Deseas sobrescribir la configuración '${targetConfig.name}' en Supabase con los coeficientes Beta y clusters actuales en pantalla? Esta acción actualizará la plantilla compartida.`
+      )
+    ) {
+      return;
+    }
+
+    setQuickUpdatingId(targetConfig.id || null);
+    try {
+      const res = await apiFetch<{
+        success: boolean;
+        configuration?: SavedClusterConfiguration;
+        error?: string;
+        message?: string;
+      }>("/api/cluster-configurations", {
+        method: "POST",
+        body: JSON.stringify({
+          id: targetConfig.id,
+          name: targetConfig.name,
+          description: targetConfig.description,
+          clusterColumn: currentClusterColumn,
+          clusterBetas: currentClusterBetas,
+          defaultBetas: currentDefaultBetas,
+          customClusters: currentCustomClusters,
+          author: targetConfig.author || undefined,
+        }),
+      });
+
+      if (res.success && res.configuration) {
+        onSaveConfiguration?.(res.configuration);
+        await fetchSavedConfigurations();
+        alert(res.message || `Configuración '${targetConfig.name}' actualizada exitosamente en Supabase.`);
+      } else {
+        alert(res.error || "No se pudo actualizar la configuración.");
+      }
+    } catch (err: any) {
+      alert(err.message || "Error al actualizar la configuración.");
+    } finally {
+      setQuickUpdatingId(null);
+    }
+  };
+
   // Manejo de eliminación
   const handleDeleteConfig = async (id: number | string, name: string) => {
-    if (!window.confirm(`¿Estás seguro de eliminar la configuración '${name}' de Supabase? Esta acción afectará a todos los usuarios.`)) {
+    if (
+      !window.confirm(
+        `¿Estás seguro de eliminar la configuración '${name}' de Supabase? Esta acción afectará a todos los usuarios.`
+      )
+    ) {
       return;
     }
 
@@ -414,6 +492,11 @@ export default function ClusterConfigModal({
                               <h4 className="text-sm font-bold text-white group-hover:text-cyan-300 transition">
                                 {cfg.name}
                               </h4>
+                              {activeLoadedConfig && String(activeLoadedConfig.id) === String(cfg.id) && (
+                                <span className="rounded-md bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
+                                  Activa
+                                </span>
+                              )}
                               <span className="rounded bg-cyan-500/10 border border-cyan-500/20 px-2 py-0.5 text-[10px] font-mono text-cyan-300">
                                 Columna: {cfg.clusterColumn}
                               </span>
@@ -437,6 +520,21 @@ export default function ClusterConfigModal({
                             >
                               <span>Cargar</span>
                               <ArrowRight className="h-3.5 w-3.5" />
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleQuickOverwrite(cfg)}
+                              disabled={quickUpdatingId === cfg.id}
+                              className="flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/25 px-2.5 py-1.5 text-xs font-medium text-indigo-300 hover:text-white transition cursor-pointer"
+                              title="Sobrescribir esta plantilla con las ponderaciones y clusters actuales en pantalla"
+                            >
+                              {quickUpdatingId === cfg.id ? (
+                                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Save className="h-3.5 w-3.5" />
+                              )}
+                              <span className="hidden sm:inline">Sobrescribir</span>
                             </button>
 
                             <button
@@ -535,6 +633,91 @@ export default function ClusterConfigModal({
                 </div>
               )}
 
+              {/* Selector de Modo: Actualizar Existente vs Crear Nueva */}
+              {savedConfigs.length > 0 && (
+                <div className="flex items-center gap-2 rounded-xl bg-slate-950/80 p-1.5 border border-white/10">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSaveAction("update");
+                      const defaultId =
+                        activeLoadedConfig?.id ||
+                        (savedConfigs.length > 0 ? savedConfigs[0].id : "");
+                      setSelectedUpdateConfigId(defaultId || "");
+                      const target = savedConfigs.find((c) => String(c.id) === String(defaultId));
+                      if (target) {
+                        setConfigName(target.name);
+                        setConfigDescription(target.description || "");
+                        setAuthorName(target.author || "");
+                      }
+                    }}
+                    className={`flex-1 flex items-center justify-center gap-2 rounded-lg py-2 px-3 text-xs font-semibold transition cursor-pointer ${
+                      saveAction === "update"
+                        ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                        : "text-slate-400 hover:text-white hover:bg-white/5"
+                    }`}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>Actualizar plantilla existente</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSaveAction("create");
+                      setSelectedUpdateConfigId("");
+                      if (activeLoadedConfig) {
+                        setConfigName(`${activeLoadedConfig.name} (Modificada)`);
+                        setConfigDescription(activeLoadedConfig.description || "");
+                        setAuthorName(activeLoadedConfig.author || "");
+                      } else {
+                        setConfigName("");
+                      }
+                    }}
+                    className={`flex-1 flex items-center justify-center gap-2 rounded-lg py-2 px-3 text-xs font-semibold transition cursor-pointer ${
+                      saveAction === "create"
+                        ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm"
+                        : "text-slate-400 hover:text-white hover:bg-white/5"
+                    }`}
+                  >
+                    <Share2 className="h-3.5 w-3.5" />
+                    <span>Guardar como nueva plantilla</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Selector de Plantilla a Actualizar (solo si modo === 'update') */}
+              {saveAction === "update" && savedConfigs.length > 0 && (
+                <div className="rounded-xl border border-cyan-500/30 bg-cyan-950/20 p-3.5 space-y-2">
+                  <label className="block text-slate-200 font-semibold text-xs">
+                    Selecciona la plantilla en Supabase a actualizar con los cambios:
+                  </label>
+                  <select
+                    value={String(selectedUpdateConfigId)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setSelectedUpdateConfigId(val);
+                      const found = savedConfigs.find((c) => String(c.id) === val);
+                      if (found) {
+                        setConfigName(found.name);
+                        setConfigDescription(found.description || "");
+                        setAuthorName(found.author || "");
+                      }
+                    }}
+                    className="w-full rounded-xl border border-cyan-500/40 bg-slate-950 px-3.5 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                  >
+                    {savedConfigs.map((cfg) => (
+                      <option key={cfg.id} value={String(cfg.id)}>
+                        {cfg.name} {activeLoadedConfig && String(activeLoadedConfig.id) === String(cfg.id) ? "(Plantilla Activa)" : ""} — Columna: {cfg.clusterColumn} {cfg.author ? `(${cfg.author})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[11px] text-cyan-200/80">
+                    Se actualizarán las ponderaciones Beta, clusters personalizados y columna de esta plantilla con tus modificaciones actuales.
+                  </p>
+                </div>
+              )}
+
               <div className="rounded-xl border border-white/10 bg-slate-950/60 p-4 space-y-3">
                 <span className="text-xs font-bold text-white flex items-center gap-1.5">
                   <Tag className="h-3.5 w-3.5 text-cyan-400" />
@@ -619,10 +802,18 @@ export default function ClusterConfigModal({
                 >
                   {isSaving ? (
                     <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : saveAction === "update" ? (
+                    <Save className="h-4 w-4" />
                   ) : (
                     <Share2 className="h-4 w-4" />
                   )}
-                  <span>{isSaving ? "Guardando en Supabase..." : "Guardar en Supabase"}</span>
+                  <span>
+                    {isSaving
+                      ? "Guardando en Supabase..."
+                      : saveAction === "update"
+                      ? "Actualizar en Supabase"
+                      : "Guardar como Nueva en Supabase"}
+                  </span>
                 </button>
               </div>
             </form>

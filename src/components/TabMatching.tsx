@@ -195,6 +195,8 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [activeLoadedConfig, setActiveLoadedConfig] = useState<SavedClusterConfiguration | null>(null);
   const [clusterVerification, setClusterVerification] = useState<ClusterVerificationResult | null>(null);
   const [dismissedVerification, setDismissedVerification] = useState(false);
+  const [isSavingDirectClusterConfig, setIsSavingDirectClusterConfig] = useState(false);
+  const [clusterSaveFeedback, setClusterSaveFeedback] = useState<string | null>(null);
 
   // ── Configuración de Pares de Distancia Multi-Vector (Profesor ↔ Asignatura) ──
   const [availableAsigVectorCols, setAvailableAsigVectorCols] = useState<string[]>(["embedding_768"]);
@@ -501,9 +503,13 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   }, [loadAvailableClusters, clusterColumn]);
 
   const allClustersList = useMemo(() => {
-    const set = new Set([...detectedClusters, ...customClusters]);
+    const set = new Set([
+      ...detectedClusters,
+      ...customClusters,
+      ...Object.keys(clusterBetas),
+    ]);
     return Array.from(set).sort();
-  }, [detectedClusters, customClusters]);
+  }, [detectedClusters, customClusters, clusterBetas]);
 
   // ── Clusters activos presentes en las asignaturas actuales (filtradas o catálogo completo) ──
   const currentActiveAsignaturaClusters = useMemo(() => {
@@ -517,6 +523,83 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     }
     return detectedClusters;
   }, [isFilterEffective, filteredAsignaturas, clusterColumn, detectedClusters]);
+
+  // Detectar si la configuración de cluster actual difiere de la plantilla activa (o si se editaron betas/clusters sin guardar)
+  const hasUnsavedClusterChanges = useMemo(() => {
+    if (!activeLoadedConfig) {
+      return Object.keys(clusterBetas).length > 0 || customClusters.length > 0;
+    }
+
+    if (clusterColumn !== (activeLoadedConfig.clusterColumn || "cluster")) return true;
+
+    const cCustom = [...customClusters].sort().join("|");
+    const lCustom = [...(activeLoadedConfig.customClusters || [])].sort().join("|");
+    if (cCustom !== lCustom) return true;
+
+    const allDefKeys = new Set([
+      ...Object.keys(defaultBetas),
+      ...Object.keys(activeLoadedConfig.defaultBetas || {}),
+    ]);
+    for (const k of allDefKeys) {
+      if ((defaultBetas[k] ?? 0) !== (activeLoadedConfig.defaultBetas?.[k] ?? 0)) return true;
+    }
+
+    const allClusters = new Set([
+      ...Object.keys(clusterBetas),
+      ...Object.keys(activeLoadedConfig.clusterBetas || {}),
+    ]);
+    for (const c of allClusters) {
+      const curB = clusterBetas[c] || {};
+      const lodB = activeLoadedConfig.clusterBetas?.[c] || {};
+      const allPairKeys = new Set([...Object.keys(curB), ...Object.keys(lodB)]);
+      for (const pk of allPairKeys) {
+        if ((curB[pk] ?? 0) !== (lodB[pk] ?? 0)) return true;
+      }
+    }
+
+    return false;
+  }, [activeLoadedConfig, clusterColumn, customClusters, defaultBetas, clusterBetas]);
+
+  // Cargar configuración de clusters desde localStorage al iniciar
+  useEffect(() => {
+    try {
+      const cached = localStorage.getItem("pradem_cluster_config_cache");
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed.clusterColumn) setClusterColumn(parsed.clusterColumn);
+        if (parsed.customClusters && Array.isArray(parsed.customClusters)) {
+          setCustomClusters(parsed.customClusters);
+        }
+        if (parsed.clusterBetas && typeof parsed.clusterBetas === "object") {
+          setClusterBetas(parsed.clusterBetas);
+        }
+        if (parsed.defaultBetas && typeof parsed.defaultBetas === "object") {
+          setDefaultBetas(parsed.defaultBetas);
+        }
+        if (parsed.activeLoadedConfig) {
+          setActiveLoadedConfig(parsed.activeLoadedConfig);
+        }
+      }
+    } catch (e) {
+      console.warn("Error al restaurar configuración de clusters desde localStorage:", e);
+    }
+  }, []);
+
+  // Guardar configuración de clusters automáticamente en localStorage cuando cambia
+  useEffect(() => {
+    const toSave = {
+      clusterColumn,
+      customClusters,
+      clusterBetas,
+      defaultBetas,
+      activeLoadedConfig,
+    };
+    try {
+      localStorage.setItem("pradem_cluster_config_cache", JSON.stringify(toSave));
+    } catch (e) {
+      // Ignorar errores de almacenamiento
+    }
+  }, [clusterColumn, customClusters, clusterBetas, defaultBetas, activeLoadedConfig]);
 
   // Re-verificar configuración activa contra asignaturas actuales cuando cambian
   useEffect(() => {
@@ -562,6 +645,63 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     setDismissedVerification(false);
   };
 
+  // Guardar modificaciones directamente en la plantilla activa de Supabase
+  const handleDirectSaveActiveConfig = async () => {
+    if (!activeLoadedConfig || !activeLoadedConfig.id) {
+      setClusterConfigModalTab("save");
+      setIsClusterConfigModalOpen(true);
+      return;
+    }
+
+    setIsSavingDirectClusterConfig(true);
+    setClusterSaveFeedback(null);
+    try {
+      const res = await apiFetch<{
+        success: boolean;
+        configuration?: SavedClusterConfiguration;
+        error?: string;
+        message?: string;
+      }>("/api/cluster-configurations", {
+        method: "POST",
+        body: JSON.stringify({
+          id: activeLoadedConfig.id,
+          name: activeLoadedConfig.name,
+          description: activeLoadedConfig.description,
+          clusterColumn,
+          clusterBetas,
+          defaultBetas,
+          customClusters,
+          author: activeLoadedConfig.author || undefined,
+        }),
+      });
+
+      if (res.success && res.configuration) {
+        setActiveLoadedConfig(res.configuration);
+        setClusterSaveFeedback(`¡Modificaciones guardadas exitosamente en '${res.configuration.name}'!`);
+        setTimeout(() => setClusterSaveFeedback(null), 4000);
+      } else {
+        alert(res.error || "Error al guardar modificaciones en Supabase.");
+      }
+    } catch (err: any) {
+      alert(err.message || "Error al conectar con Supabase.");
+    } finally {
+      setIsSavingDirectClusterConfig(false);
+    }
+  };
+
+  // Revertir modificaciones a los valores originales de la plantilla activa
+  const handleRevertClusterChanges = () => {
+    if (!activeLoadedConfig) return;
+    if (
+      !window.confirm(
+        `¿Deseas descartar las modificaciones locales y restablecer los valores originales de la plantilla '${activeLoadedConfig.name}'?`
+      )
+    ) {
+      return;
+    }
+    handleLoadConfiguration(activeLoadedConfig);
+  };
+
   // Manejador para agregar clusters faltantes a la configuración
   const handleAddMissingClustersToConfig = () => {
     if (!clusterVerification || clusterVerification.missingInConfig.length === 0) return;
@@ -576,6 +716,20 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     setActiveLoadedConfig(null);
     setClusterVerification(null);
     setDismissedVerification(false);
+  };
+
+  // Eliminar cluster manual
+  const handleRemoveCustomCluster = (cName: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCustomClusters((prev) => prev.filter((c) => c !== cName));
+    setClusterBetas((prev) => {
+      const next = { ...prev };
+      delete next[cName];
+      return next;
+    });
+    if (selectedClusterTab === cName) {
+      setSelectedClusterTab("__default__");
+    }
   };
 
   const activeFields = useMemo(() => {
@@ -693,12 +847,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
     if (!activePairs.length) return;
 
     setDefaultBetas((prev) => {
+      let changed = false;
       const next = { ...prev };
       let missingCount = 0;
       activePairs.forEach((p) => {
         if (typeof next[p.id] !== "number") {
           if (typeof next[p.profField] === "number") {
             next[p.id] = next[p.profField];
+            changed = true;
           } else {
             missingCount++;
           }
@@ -706,6 +862,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
       });
 
       if (missingCount > 0 || Object.keys(next).length === 0) {
+        changed = true;
         const totalW = activePairs.reduce((acc, p) => {
           const cfg = queryConfigs.find((c) => c.field === p.profField);
           const w = p.weight ?? (cfg && cfg.weight > 0 ? cfg.weight : 1);
@@ -720,17 +877,20 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           }
         });
       }
-      return next;
+      return changed ? next : prev;
     });
 
     setClusterBetas((prev) => {
+      let changed = false;
       const next = { ...prev };
       allClustersList.forEach((cluster) => {
         if (!next[cluster]) {
           next[cluster] = {};
+          changed = true;
         }
         activePairs.forEach((p) => {
           if (typeof next[cluster][p.id] !== "number") {
+            changed = true;
             if (typeof next[cluster][p.profField] === "number") {
               next[cluster][p.id] = next[cluster][p.profField];
             } else {
@@ -740,7 +900,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           }
         });
       });
-      return next;
+      return changed ? next : prev;
     });
   }, [activePairs, allClustersList, queryConfigs, defaultBetas]);
 
@@ -3645,11 +3805,18 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     setClusterConfigModalTab("save");
                     setIsClusterConfigModalOpen(true);
                   }}
-                  className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 px-3 py-1.5 text-xs font-semibold text-slate-200 transition cursor-pointer hover:border-white/20"
+                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                    hasUnsavedClusterChanges
+                      ? "border-indigo-500/50 bg-indigo-950/50 text-indigo-200 hover:bg-indigo-900/60 hover:border-indigo-400 shadow-sm"
+                      : "border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 hover:border-white/20"
+                  }`}
                   title="Guardar la configuración actual en Supabase para compartirla con todo el equipo"
                 >
                   <Save className="h-3.5 w-3.5 text-indigo-400" />
                   <span>Guardar Plantilla</span>
+                  {hasUnsavedClusterChanges && (
+                    <span className="flex h-1.5 w-1.5 rounded-full bg-amber-400" title="Hay modificaciones sin guardar"></span>
+                  )}
                 </button>
               </div>
             </div>
@@ -3662,10 +3829,21 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                     <Cloud className="h-4 w-4" />
                   </div>
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="font-bold text-white text-xs">
                         Plantilla Activa: {activeLoadedConfig.name}
                       </span>
+                      {hasUnsavedClusterChanges ? (
+                        <span className="rounded-full bg-amber-500/20 border border-amber-500/30 px-2 py-0.5 text-[10px] font-bold text-amber-300 flex items-center gap-1">
+                          <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                          Modificaciones sin guardar
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-medium text-emerald-300 flex items-center gap-1">
+                          <Check className="h-3 w-3" />
+                          Sincronizada con Supabase
+                        </span>
+                      )}
                       {activeLoadedConfig.clusterColumn && (
                         <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] font-mono text-indigo-300">
                           Columna: {activeLoadedConfig.clusterColumn}
@@ -3685,7 +3863,49 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  {hasUnsavedClusterChanges && (
+                    <button
+                      type="button"
+                      onClick={handleDirectSaveActiveConfig}
+                      disabled={isSavingDirectClusterConfig}
+                      className="flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white shadow-md shadow-emerald-950 transition cursor-pointer"
+                      title="Guardar modificaciones directamente en esta plantilla en Supabase"
+                    >
+                      {isSavingDirectClusterConfig ? (
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Save className="h-3.5 w-3.5" />
+                      )}
+                      <span>{isSavingDirectClusterConfig ? "Guardando..." : "Guardar Cambios"}</span>
+                    </button>
+                  )}
+
+                  {hasUnsavedClusterChanges && (
+                    <button
+                      type="button"
+                      onClick={handleRevertClusterChanges}
+                      className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
+                      title="Descartar modificaciones y volver a los valores originales de la plantilla"
+                    >
+                      <RotateCcw className="h-3 w-3 text-slate-400" />
+                      <span>Revertir</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClusterConfigModalTab("save");
+                      setIsClusterConfigModalOpen(true);
+                    }}
+                    className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
+                    title="Abrir modal para guardar como nueva plantilla o actualizar otra"
+                  >
+                    <Share2 className="h-3 w-3 text-cyan-400" />
+                    <span>Guardar Como...</span>
+                  </button>
+
                   {dismissedVerification && (
                     <button
                       type="button"
@@ -3695,16 +3915,25 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                       Ver estado de verificación
                     </button>
                   )}
+
                   <button
                     type="button"
                     onClick={handleClearActiveLoadedConfig}
-                    className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
+                    className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 hover:text-white transition cursor-pointer"
                     title="Desvincular esta plantilla y mantener valores editados localmente"
                   >
-                    <RotateCcw className="h-3 w-3 text-slate-400" />
-                    <span>Desvincular Plantilla</span>
+                    <X className="h-3 w-3 text-slate-400" />
+                    <span>Desvincular</span>
                   </button>
                 </div>
+              </div>
+            )}
+
+            {/* Aviso de confirmación de guardado directo */}
+            {clusterSaveFeedback && (
+              <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/40 p-3 text-xs text-emerald-300 animate-in fade-in">
+                <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                <span>{clusterSaveFeedback}</span>
               </div>
             )}
 
@@ -3820,23 +4049,38 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                   </span>
                 </button>
 
-                {/* Pestañas de clusters detectados */}
+                {/* Pestañas de clusters detectados y personalizados */}
                 {allClustersList.map((cName) => {
                   const isSelected = selectedClusterTab === cName;
+                  const isCustom = customClusters.includes(cName);
                   return (
-                    <button
+                    <div
                       key={cName}
-                      type="button"
-                      onClick={() => setSelectedClusterTab(cName)}
-                      className={`flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
+                      className={`inline-flex items-center rounded-xl border transition ${
                         isSelected
                           ? "border-indigo-400 bg-indigo-500/25 text-white shadow-md shadow-indigo-500/20 ring-1 ring-indigo-400"
                           : "border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
                       }`}
                     >
-                      <Tag className="h-3 w-3 text-indigo-400" />
-                      <span>{cName}</span>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedClusterTab(cName)}
+                        className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold cursor-pointer"
+                      >
+                        <Tag className="h-3 w-3 text-indigo-400" />
+                        <span>{cName}</span>
+                      </button>
+                      {isCustom && (
+                        <button
+                          type="button"
+                          onClick={(e) => handleRemoveCustomCluster(cName, e)}
+                          className="mr-2 p-0.5 rounded-full hover:bg-white/10 text-slate-400 hover:text-red-400 transition cursor-pointer"
+                          title={`Eliminar cluster personalizado '${cName}'`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
                   );
                 })}
 
@@ -5595,7 +5839,11 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
         currentDefaultBetas={defaultBetas}
         currentCustomClusters={customClusters}
         activeAsignaturaClusters={currentActiveAsignaturaClusters}
+        activeLoadedConfig={activeLoadedConfig}
         onLoadConfiguration={handleLoadConfiguration}
+        onSaveConfiguration={(saved) => {
+          setActiveLoadedConfig(saved);
+        }}
       />
     </div>
   );
