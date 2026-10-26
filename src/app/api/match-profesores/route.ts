@@ -5,7 +5,16 @@ import {
   computeCompositeEmbedding,
 } from "@/lib/gemini/embeddings";
 import { geminiRateLimiter } from "@/lib/gemini/rate-limiter";
-import { Profesor, QueryConfig, MatchResultItem, ProfesorMatchResult, RegexFilterConfig, DistancePairConfig } from "@/types";
+import {
+  Profesor,
+  QueryConfig,
+  MatchResultItem,
+  ProfesorMatchResult,
+  RegexFilterConfig,
+  DistancePairConfig,
+  PenalizationConfig,
+  PENALIZATION_SEVERITY_VALUES,
+} from "@/types";
 import {
   sanitizarCvParaModelo,
   evaluateProfessorCredentialAcrossFields,
@@ -83,6 +92,56 @@ function fastDotProduct(vecA: Float32Array, vecB: Float32Array): number {
       vecA[i + 7] * vecB[i + 7];
   }
   return dot;
+}
+
+/**
+ * Parsea con seguridad valores booleanos provenientes de columnas de Supabase
+ * que pueden haber sido almacenadas como string ("True"/"False") o booleano.
+ */
+function parseBooleanFlag(val: unknown): boolean {
+  if (typeof val === "boolean") return val;
+  if (typeof val === "string") {
+    const s = val.trim().toLowerCase();
+    return s === "true" || s === "1" || s === "t" || s === "verdadero" || s === "yes" || s === "si" || s === "sí";
+  }
+  if (typeof val === "number") return val === 1;
+  return false;
+}
+
+/**
+ * Calcula la desviación estándar muestral sobre una muestra aleatoria de puntuaciones de similitud.
+ * Muestrea como máximo `maxSample` elementos (por defecto 1,000) para garantizar
+ * que la operación tome menos de 0.05ms en CPU y no sature la memoria del runtime.
+ */
+function computeSampleStd(scores: number[], maxSample = 1000): number {
+  const nTotal = scores.length;
+  if (nTotal < 2) return 0;
+  const sampleSize = Math.min(nTotal, maxSample);
+  let sample: number[];
+  if (nTotal <= maxSample) {
+    sample = scores;
+  } else {
+    sample = new Array(sampleSize);
+    const step = nTotal / sampleSize;
+    for (let i = 0; i < sampleSize; i++) {
+      const idx = Math.min(nTotal - 1, Math.floor(i * step + Math.random() * Math.max(1, step * 0.5)));
+      sample[i] = scores[idx];
+    }
+  }
+
+  let sum = 0;
+  for (let i = 0; i < sample.length; i++) {
+    sum += sample[i];
+  }
+  const mean = sum / sample.length;
+
+  let sumSqDiff = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const diff = sample[i] - mean;
+    sumSqDiff += diff * diff;
+  }
+  const variance = sumSqDiff / (sample.length - 1);
+  return Math.sqrt(Math.max(0, variance));
 }
 
 /**
@@ -172,7 +231,36 @@ export async function POST(req: NextRequest) {
     const topK: number = typeof body.topK === "number" ? Math.max(1, body.topK) : 3;
     const regexFilter: RegexFilterConfig | undefined = body.regexFilter;
 
-    // Filtro opcional de asignaturas (IDs específicos pasados tras el paso inicial de filtro)
+    // Configuración de penalizaciones por criterios
+    const rawPenalization: Partial<PenalizationConfig> | undefined = body.penalizationConfig;
+    const penalizationConfig: PenalizationConfig = {
+      enabled: rawPenalization?.enabled ?? true,
+      match_nombre: {
+        active: Boolean(rawPenalization?.match_nombre?.active),
+        severity: rawPenalization?.match_nombre?.severity || "5/100",
+      },
+      match_semantico: {
+        active: Boolean(rawPenalization?.match_semantico?.active),
+        severity: rawPenalization?.match_semantico?.severity || "5/100",
+      },
+      match_nombre_area_programa: {
+        active: Boolean(rawPenalization?.match_nombre_area_programa?.active),
+        severity: rawPenalization?.match_nombre_area_programa?.severity || "5/100",
+      },
+      match_semantico_area_programa: {
+        active: Boolean(rawPenalization?.match_semantico_area_programa?.active),
+        severity: rawPenalization?.match_semantico_area_programa?.severity || "5/100",
+      },
+    };
+
+    const isAnyPenalizationActive = Boolean(
+      penalizationConfig.enabled && (
+        penalizationConfig.match_nombre.active ||
+        penalizationConfig.match_semantico.active ||
+        penalizationConfig.match_nombre_area_programa.active ||
+        penalizationConfig.match_semantico_area_programa.active
+      )
+    );
     const rawFilterIds: unknown[] = Array.isArray(body.filterAsignaturaIds) ? body.filterAsignaturaIds : [];
     const filterAsignaturaIds: number[] = rawFilterIds
       .map((id) => Number(id))
@@ -416,7 +504,16 @@ export async function POST(req: NextRequest) {
     // Omitir textos masivos (contenido_tematico, fines_de_aprendizaje, actividades)
     // reduce el payload en un 85% y elimina por completo el error de 'statement timeout'.
     const cleanClusterCol = clusterColumn && /^[a-zA-Z0-9_]+$/.test(clusterColumn) ? clusterColumn : "cluster";
-    const baseCols = ["id", "clave", "nombre", "cluster", "match_nombre"];
+    const baseCols = [
+      "id",
+      "clave",
+      "nombre",
+      "cluster",
+      "match_nombre",
+      "match_semantico",
+      "match_nombre_area_programa",
+      "match_semantico_area_programa",
+    ];
     if (cleanClusterCol !== "cluster" && !baseCols.includes(cleanClusterCol)) {
       baseCols.push(cleanClusterCol);
     }
@@ -431,14 +528,14 @@ export async function POST(req: NextRequest) {
           targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
         } catch (innerErr: any) {
           if (cleanClusterCol !== "cluster") {
-            selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768";
+            selectCols = "id, clave, nombre, cluster, match_nombre, match_semantico, match_nombre_area_programa, match_semantico_area_programa, embedding_768";
             targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
           } else {
             throw innerErr;
           }
         }
       } else if (cleanClusterCol !== "cluster" && (fetchErr.message?.includes(cleanClusterCol) || fetchErr.code === "42703")) {
-        selectCols = "id, clave, nombre, cluster, match_nombre, embedding_768, vectors";
+        selectCols = "id, clave, nombre, cluster, match_nombre, match_semantico, match_nombre_area_programa, match_semantico_area_programa, embedding_768, vectors";
         targetRows = await fetchCandidateRows(supabase, selectCols, filterAsignaturaIds, hasFilter);
       } else {
         throw new Error(`Error al consultar asignaturas en Supabase: ${fetchErr.message}`);
@@ -454,6 +551,9 @@ export async function POST(req: NextRequest) {
       nombre: string;
       cluster: string | null;
       match_nombre: boolean;
+      match_semantico: boolean;
+      match_nombre_area_programa: boolean;
+      match_semantico_area_programa: boolean;
       pairVectors: (Float32Array | null)[];
       clusterWeights: number[];
       rawPrimaryEmbedding: number[] | null;
@@ -548,7 +648,10 @@ export async function POST(req: NextRequest) {
         clave: r.clave || "",
         nombre: r.nombre || "",
         cluster: cleanCluster,
-        match_nombre: Boolean(r.match_nombre),
+        match_nombre: parseBooleanFlag(r.match_nombre),
+        match_semantico: parseBooleanFlag(r.match_semantico),
+        match_nombre_area_programa: parseBooleanFlag(r.match_nombre_area_programa),
+        match_semantico_area_programa: parseBooleanFlag(r.match_semantico_area_programa),
         pairVectors,
         clusterWeights,
         rawPrimaryEmbedding: rawPrimaryEmb,
@@ -568,7 +671,7 @@ export async function POST(req: NextRequest) {
 
     const results: ProfesorMatchResult[] = [];
 
-    // ── CÁLCULO ULTRA-RÁPIDO DE DISTANCIAS Y SCORE PONDERADO ──
+    // ── CÁLCULO ULTRA-RÁPIDO DE DISTANCIAS, PENALIZACIONES Y SCORE PONDERADO ──
     for (let pIdx = 0; pIdx < profesores.length; pIdx++) {
       const prof = profesores[pIdx];
       const fieldEmbeddings = profFieldEmbeddings[pIdx] || {};
@@ -587,12 +690,9 @@ export async function POST(req: NextRequest) {
           profPairVectors[p] = rawVec ? parseEmbeddingToFloat32(rawVec) : null;
         }
 
-        // Evaluar todas las asignaturas candidatas
-        const candidateScores: {
-          targetIndex: number;
-          compositeSim: number;
-          pSims: number[];
-        }[] = [];
+        // 1. Evaluar similitudes compuestas crudas para todas las asignaturas candidatas
+        const rawScores = new Float32Array(preparedTargets.length);
+        const allPairSims: number[][] = new Array(preparedTargets.length);
 
         for (let aIdx = 0; aIdx < preparedTargets.length; aIdx++) {
           const target = preparedTargets[aIdx];
@@ -612,27 +712,92 @@ export async function POST(req: NextRequest) {
             compositeSim += target.clusterWeights[p] * sim;
           }
 
-          const passes = filterMode === "topK" ? true : compositeSim >= threshold;
+          rawScores[aIdx] = compositeSim;
+          allPairSims[aIdx] = pSims;
+        }
+
+        // 2. Si hay criterios de penalización activos, estimar la desviación estándar sobre una muestra aleatoria
+        let sampleStd = 0;
+        if (isAnyPenalizationActive) {
+          const scoreArray = Array.from(rawScores);
+          sampleStd = computeSampleStd(scoreArray, 1000);
+        }
+
+        // 3. Aplicar deducción de penalización por cada criterio activo y filtrar candidatos
+        const penalizeMatchNombre = Boolean(penalizationConfig.enabled && penalizationConfig.match_nombre.active);
+        const candidateScores: {
+          targetIndex: number;
+          compositeSim: number;
+          rawCompositeSim: number;
+          totalPenalty: number;
+          breakdown: Record<string, number>;
+          sampleStd: number;
+          pSims: number[];
+        }[] = [];
+
+        for (let aIdx = 0; aIdx < preparedTargets.length; aIdx++) {
+          const target = preparedTargets[aIdx];
+          const rawSim = rawScores[aIdx];
+          let totalPenalty = 0;
+          const breakdown: Record<string, number> = {};
+
+          if (isAnyPenalizationActive && sampleStd > 0) {
+            if (penalizationConfig.match_nombre.active && target.match_nombre) {
+              const mult = PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_nombre.severity] || 0.05;
+              const pen = mult * sampleStd;
+              totalPenalty += pen;
+              breakdown["match_nombre"] = pen;
+            }
+            if (penalizationConfig.match_semantico.active && target.match_semantico) {
+              const mult = PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_semantico.severity] || 0.05;
+              const pen = mult * sampleStd;
+              totalPenalty += pen;
+              breakdown["match_semantico"] = pen;
+            }
+            if (penalizationConfig.match_nombre_area_programa.active && target.match_nombre_area_programa) {
+              const mult = PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_nombre_area_programa.severity] || 0.05;
+              const pen = mult * sampleStd;
+              totalPenalty += pen;
+              breakdown["match_nombre_area_programa"] = pen;
+            }
+            if (penalizationConfig.match_semantico_area_programa.active && target.match_semantico_area_programa) {
+              const mult = PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_semantico_area_programa.severity] || 0.05;
+              const pen = mult * sampleStd;
+              totalPenalty += pen;
+              breakdown["match_semantico_area_programa"] = pen;
+            }
+          }
+
+          // La penalización se resta de la similitud calculada
+          const penalizedSim = Math.max(0, rawSim - totalPenalty);
+
+          const passes = filterMode === "topK" ? true : penalizedSim >= threshold;
           if (passes) {
             candidateScores.push({
               targetIndex: aIdx,
-              compositeSim,
-              pSims,
+              compositeSim: penalizedSim,
+              rawCompositeSim: rawSim,
+              totalPenalty,
+              breakdown,
+              sampleStd,
+              pSims: allPairSims[aIdx],
             });
           }
         }
 
-        // Ordenar candidatos por similitud compuesta descendente
+        // Ordenar candidatos por similitud resultante (penalizada) descendente
         candidateScores.sort((a, b) => b.compositeSim - a.compositeSim);
 
         // Selección de ganadores respetando Top K y prioridad match_nombre
+        // Si match_nombre está penalizado, NO se le exime del cupo (compite con su similitud penalizada)
         const winningScores: typeof candidateScores = [];
         if (filterMode === "threshold") {
           if (topK > 0 && topK < candidateScores.length) {
             let count = 0;
             for (const c of candidateScores) {
               const isMatchNombre = preparedTargets[c.targetIndex].match_nombre;
-              if (isMatchNombre) {
+              const bypassQuota = isMatchNombre && !penalizeMatchNombre;
+              if (bypassQuota) {
                 winningScores.push(c);
               } else if (count < topK) {
                 winningScores.push(c);
@@ -646,7 +811,8 @@ export async function POST(req: NextRequest) {
           let count = 0;
           for (const c of candidateScores) {
             const isMatchNombre = preparedTargets[c.targetIndex].match_nombre;
-            if (isMatchNombre) {
+            const bypassQuota = isMatchNombre && !penalizeMatchNombre;
+            if (bypassQuota) {
               winningScores.push(c);
             } else if (count < topK) {
               winningScores.push(c);
@@ -666,15 +832,27 @@ export async function POST(req: NextRequest) {
             pairSimsObj[pId] = Math.round(w.pSims[p] * 10000) / 10000;
           }
 
+          const formattedBreakdown: Record<string, number> = {};
+          for (const [k, v] of Object.entries(w.breakdown)) {
+            formattedBreakdown[k] = Math.round(v * 10000) / 10000;
+          }
+
           return {
             asignaturaId: target.id,
             clave: target.clave,
             nombre: target.nombre,
             cluster: target.cluster,
             compositeSimilarity: Math.round(w.compositeSim * 10000) / 10000,
+            rawCompositeSimilarity: Math.round(w.rawCompositeSim * 10000) / 10000,
+            penalizationApplied: Math.round(w.totalPenalty * 10000) / 10000,
+            penalizationBreakdown: formattedBreakdown,
+            penalizationStd: Math.round(w.sampleStd * 10000) / 10000,
             fieldSimilarities: pairSimsObj,
             pairSimilarities: pairSimsObj,
             match_nombre: target.match_nombre,
+            match_semantico: target.match_semantico,
+            match_nombre_area_programa: target.match_nombre_area_programa,
+            match_semantico_area_programa: target.match_semantico_area_programa,
             embedding_768: target.rawPrimaryEmbedding,
             vectors: target.rawVectorsMap,
           };

@@ -46,6 +46,8 @@ import {
   Share2,
   Save,
   FolderOpen,
+  Scale,
+  AlertCircle,
 } from "lucide-react";
 import {
   Profesor,
@@ -60,6 +62,10 @@ import {
   DistancePairConfig,
   SavedClusterConfiguration,
   ClusterVerificationResult,
+  PenalizationConfig,
+  PenalizationSeverity,
+  PENALIZATION_SEVERITY_VALUES,
+  DEFAULT_PENALIZATION_CONFIG,
 } from "@/types";
 import {
   DEFAULT_REGEX_FILTER_CONFIG,
@@ -203,6 +209,83 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
   const [distancePairs, setDistancePairs] = useState<DistancePairConfig[]>([]);
   const [newPairProfField, setNewPairProfField] = useState<string>("");
   const [newPairAsigCol, setNewPairAsigCol] = useState<string>("");
+
+  // ── Configuración de Penalización de Similitud por Criterios ──
+  const [penalizationConfig, setPenalizationConfig] = useState<PenalizationConfig>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("pradem_penalization_config");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          return {
+            enabled: parsed.enabled ?? DEFAULT_PENALIZATION_CONFIG.enabled,
+            match_nombre: {
+              active: Boolean(parsed.match_nombre?.active),
+              severity: parsed.match_nombre?.severity || "5/100",
+            },
+            match_semantico: {
+              active: Boolean(parsed.match_semantico?.active),
+              severity: parsed.match_semantico?.severity || "5/100",
+            },
+            match_nombre_area_programa: {
+              active: Boolean(parsed.match_nombre_area_programa?.active),
+              severity: parsed.match_nombre_area_programa?.severity || "5/100",
+            },
+            match_semantico_area_programa: {
+              active: Boolean(parsed.match_semantico_area_programa?.active),
+              severity: parsed.match_semantico_area_programa?.severity || "5/100",
+            },
+          };
+        }
+      } catch {}
+    }
+    return DEFAULT_PENALIZATION_CONFIG;
+  });
+
+  // Persistir configuración de penalizaciones en localStorage
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem("pradem_penalization_config", JSON.stringify(penalizationConfig));
+      } catch {}
+    }
+  }, [penalizationConfig]);
+
+  const activePenalizationCount = useMemo(() => {
+    let count = 0;
+    if (penalizationConfig.match_nombre.active) count++;
+    if (penalizationConfig.match_semantico.active) count++;
+    if (penalizationConfig.match_nombre_area_programa.active) count++;
+    if (penalizationConfig.match_semantico_area_programa.active) count++;
+    return count;
+  }, [penalizationConfig]);
+
+  const handleTogglePenalizationCriterion = (criterionKey: keyof Omit<PenalizationConfig, "enabled">) => {
+    setPenalizationConfig((prev) => ({
+      ...prev,
+      [criterionKey]: {
+        ...prev[criterionKey],
+        active: !prev[criterionKey].active,
+      },
+    }));
+  };
+
+  const handleSetPenalizationSeverity = (
+    criterionKey: keyof Omit<PenalizationConfig, "enabled">,
+    severity: PenalizationSeverity
+  ) => {
+    setPenalizationConfig((prev) => ({
+      ...prev,
+      [criterionKey]: {
+        ...prev[criterionKey],
+        severity,
+      },
+    }));
+  };
+
+  const handleResetPenalizationConfig = () => {
+    setPenalizationConfig(DEFAULT_PENALIZATION_CONFIG);
+  };
   // ── Estados de Filtro Inicial de Asignaturas (Paso 1: Filtro por Claves) ──
   const [filterFile, setFilterFile] = useState<File | null>(null);
   const [filterHeaders, setFilterHeaders] = useState<string[]>([]);
@@ -1519,6 +1602,7 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             clusterBetas,
             defaultBetas,
             regexFilter: importMode === "generate" ? regexFilterConfig : undefined,
+            penalizationConfig,
           }),
         });
 
@@ -2362,10 +2446,14 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             }
             if (isMetricColSelected("similitud_compuesta")) {
               rowData[`${prefix} - Similitud Compuesta`] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
+              if (m.penalizationApplied && m.penalizationApplied > 0) {
+                rowData[`${prefix} - Similitud Original`] = `${((m.rawCompositeSimilarity ?? m.compositeSimilarity) * 100).toFixed(1)}%`;
+                rowData[`${prefix} - Penalización`] = `-${(m.penalizationApplied * 100).toFixed(2)}%`;
+              }
             }
             if (isMetricColSelected("tipo_match")) {
               rowData[`${prefix} - Tipo Match`] = m.match_nombre
-                ? "Match Nombre (Exento de cupo)"
+                ? (m.penalizationApplied && m.penalizationApplied > 0 ? "Match Nombre (Penalizado)" : "Match Nombre (Exento de cupo)")
                 : "Semántico";
             }
 
@@ -2568,9 +2656,20 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
           }
           if (isMetricColSelected("similitud_compuesta")) {
             rowData["Similitud Compuesta"] = `${(m.compositeSimilarity * 100).toFixed(1)}%`;
+            if (m.penalizationApplied && m.penalizationApplied > 0) {
+              rowData["Similitud Original"] = `${((m.rawCompositeSimilarity ?? m.compositeSimilarity) * 100).toFixed(1)}%`;
+              rowData["Penalización Aplicada"] = `-${(m.penalizationApplied * 100).toFixed(2)}%`;
+              if (m.penalizationBreakdown && Object.keys(m.penalizationBreakdown).length > 0) {
+                rowData["Desglose Penalización"] = Object.entries(m.penalizationBreakdown)
+                  .map(([k, v]) => `${k}: -${(v * 100).toFixed(2)}%`)
+                  .join(" | ");
+              }
+            }
           }
           if (isMetricColSelected("tipo_match")) {
-            rowData["Tipo Match"] = m.match_nombre ? "Match Nombre (Exento de cupo)" : "Semántico";
+            rowData["Tipo Match"] = m.match_nombre
+              ? (m.penalizationApplied && m.penalizationApplied > 0 ? "Match Nombre (Penalizado)" : "Match Nombre (Exento de cupo)")
+              : "Semántico";
           }
 
           if (
@@ -4236,6 +4335,370 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
             )}
           </div>
 
+          {/* ── BLOQUE DE CRITERIOS DE PENALIZACIÓN DE SIMILITUD ── */}
+          <div className="rounded-xl border border-white/10 bg-slate-950/80 p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2">
+                  <Scale className="h-4 w-4 text-rose-400" />
+                  Criterios de Penalización de Similitud
+                </h4>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Aplica deducciones calibradas sobre la similitud calculada según criterios de coincidencia previa. Cada criterio activo resta una fracción de la desviación estándar muestral (&sigma;) calculada sobre un muestreo aleatorio en el servidor.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {activePenalizationCount > 0 ? (
+                  <span className="rounded-lg bg-rose-500/15 border border-rose-500/30 px-2.5 py-1 text-[11px] font-semibold text-rose-300 flex items-center gap-1.5">
+                    <AlertCircle className="h-3.5 w-3.5 text-rose-400" />
+                    <span>{activePenalizationCount} {activePenalizationCount === 1 ? "criterio activo" : "criterios activos"}</span>
+                  </span>
+                ) : (
+                  <span className="rounded-lg bg-slate-900 border border-white/10 px-2.5 py-1 text-[11px] font-medium text-slate-400 flex items-center gap-1.5">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-slate-500" />
+                    <span>Sin penalizaciones</span>
+                  </span>
+                )}
+
+                {activePenalizationCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleResetPenalizationConfig}
+                    className="flex items-center gap-1 text-[11px] rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-slate-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
+                    title="Desactiva todos los criterios de penalización"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    <span>Restablecer</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Cuadrícula de 4 Criterios */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5 pt-1">
+              {/* Criterio 1: match_nombre */}
+              <div
+                className={`rounded-xl border p-4 transition space-y-3 ${
+                  penalizationConfig.match_nombre.active
+                    ? "border-rose-500/40 bg-gradient-to-br from-rose-950/20 via-slate-900/60 to-slate-950 shadow-sm shadow-rose-950/30"
+                    : "border-white/5 bg-slate-900/30 hover:border-white/10"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-white">
+                        1. Coincidencia por Nombre
+                      </span>
+                      <span className="rounded bg-rose-500/15 border border-rose-500/30 px-1.5 py-0.5 text-[10px] font-mono text-rose-300 font-semibold">
+                        match_nombre = True
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Penaliza asignaturas que tengan coincidencia directa o textual en el nombre.
+                      {penalizationConfig.match_nombre.active && (
+                        <span className="block text-[10px] text-rose-300/90 font-medium mt-0.5">
+                          ⚠️ Al activarse, estas asignaturas ya no contarán con exención automática de cupo Top K y competirán con su similitud penalizada.
+                        </span>
+                      )}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleTogglePenalizationCriterion("match_nombre")}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                      penalizationConfig.match_nombre.active ? "bg-rose-600" : "bg-slate-700"
+                    }`}
+                    role="switch"
+                    aria-checked={penalizationConfig.match_nombre.active}
+                    title={penalizationConfig.match_nombre.active ? "Desactivar penalización" : "Activar penalización"}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                        penalizationConfig.match_nombre.active ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Selector de Severidad */}
+                {penalizationConfig.match_nombre.active && (
+                  <div className="pt-2 border-t border-rose-500/20 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">Severidad de penalización:</span>
+                      <span className="text-rose-300 font-mono font-bold">
+                        {penalizationConfig.match_nombre.severity} &sigma; ({(PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_nombre.severity] * 100).toFixed(0)}% std)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(["5/100", "10/100", "20/100"] as PenalizationSeverity[]).map((sev) => {
+                        const isSelected = penalizationConfig.match_nombre.severity === sev;
+                        return (
+                          <button
+                            key={sev}
+                            type="button"
+                            onClick={() => handleSetPenalizationSeverity("match_nombre", sev)}
+                            className={`rounded-lg py-1.5 px-2 text-center text-[11px] font-mono transition cursor-pointer flex flex-col items-center justify-center gap-0.5 border ${
+                              isSelected
+                                ? "bg-rose-500/25 border-rose-500/60 text-white font-bold shadow-sm shadow-rose-900/50"
+                                : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+                            }`}
+                          >
+                            <span>{sev} std</span>
+                            <span className="text-[9px] text-slate-400">
+                              {(PENALIZATION_SEVERITY_VALUES[sev] * 100).toFixed(0)}% de &sigma;
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Criterio 2: match_semantico */}
+              <div
+                className={`rounded-xl border p-4 transition space-y-3 ${
+                  penalizationConfig.match_semantico.active
+                    ? "border-rose-500/40 bg-gradient-to-br from-rose-950/20 via-slate-900/60 to-slate-950 shadow-sm shadow-rose-950/30"
+                    : "border-white/5 bg-slate-900/30 hover:border-white/10"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-white">
+                        2. Coincidencia Semántica
+                      </span>
+                      <span className="rounded bg-sky-500/15 border border-sky-500/30 px-1.5 py-0.5 text-[10px] font-mono text-sky-300 font-semibold">
+                        match_semantico = True
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Penaliza asignaturas catalogadas previamente con coincidencia semántica en la base de datos.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleTogglePenalizationCriterion("match_semantico")}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                      penalizationConfig.match_semantico.active ? "bg-rose-600" : "bg-slate-700"
+                    }`}
+                    role="switch"
+                    aria-checked={penalizationConfig.match_semantico.active}
+                    title={penalizationConfig.match_semantico.active ? "Desactivar penalización" : "Activar penalización"}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                        penalizationConfig.match_semantico.active ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Selector de Severidad */}
+                {penalizationConfig.match_semantico.active && (
+                  <div className="pt-2 border-t border-rose-500/20 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">Severidad de penalización:</span>
+                      <span className="text-rose-300 font-mono font-bold">
+                        {penalizationConfig.match_semantico.severity} &sigma; ({(PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_semantico.severity] * 100).toFixed(0)}% std)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(["5/100", "10/100", "20/100"] as PenalizationSeverity[]).map((sev) => {
+                        const isSelected = penalizationConfig.match_semantico.severity === sev;
+                        return (
+                          <button
+                            key={sev}
+                            type="button"
+                            onClick={() => handleSetPenalizationSeverity("match_semantico", sev)}
+                            className={`rounded-lg py-1.5 px-2 text-center text-[11px] font-mono transition cursor-pointer flex flex-col items-center justify-center gap-0.5 border ${
+                              isSelected
+                                ? "bg-rose-500/25 border-rose-500/60 text-white font-bold shadow-sm shadow-rose-900/50"
+                                : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+                            }`}
+                          >
+                            <span>{sev} std</span>
+                            <span className="text-[9px] text-slate-400">
+                              {(PENALIZATION_SEVERITY_VALUES[sev] * 100).toFixed(0)}% de &sigma;
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Criterio 3: match_nombre_area_programa */}
+              <div
+                className={`rounded-xl border p-4 transition space-y-3 ${
+                  penalizationConfig.match_nombre_area_programa.active
+                    ? "border-rose-500/40 bg-gradient-to-br from-rose-950/20 via-slate-900/60 to-slate-950 shadow-sm shadow-rose-950/30"
+                    : "border-white/5 bg-slate-900/30 hover:border-white/10"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-white">
+                        3. Match Nombre por Área/Programa
+                      </span>
+                      <span className="rounded bg-indigo-500/15 border border-indigo-500/30 px-1.5 py-0.5 text-[10px] font-mono text-indigo-300 font-semibold">
+                        match_nombre_area_programa = True
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Penaliza asignaturas con concordancia de nombre a nivel de área de conocimiento o programa académico.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleTogglePenalizationCriterion("match_nombre_area_programa")}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                      penalizationConfig.match_nombre_area_programa.active ? "bg-rose-600" : "bg-slate-700"
+                    }`}
+                    role="switch"
+                    aria-checked={penalizationConfig.match_nombre_area_programa.active}
+                    title={penalizationConfig.match_nombre_area_programa.active ? "Desactivar penalización" : "Activar penalización"}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                        penalizationConfig.match_nombre_area_programa.active ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Selector de Severidad */}
+                {penalizationConfig.match_nombre_area_programa.active && (
+                  <div className="pt-2 border-t border-rose-500/20 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">Severidad de penalización:</span>
+                      <span className="text-rose-300 font-mono font-bold">
+                        {penalizationConfig.match_nombre_area_programa.severity} &sigma; ({(PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_nombre_area_programa.severity] * 100).toFixed(0)}% std)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(["5/100", "10/100", "20/100"] as PenalizationSeverity[]).map((sev) => {
+                        const isSelected = penalizationConfig.match_nombre_area_programa.severity === sev;
+                        return (
+                          <button
+                            key={sev}
+                            type="button"
+                            onClick={() => handleSetPenalizationSeverity("match_nombre_area_programa", sev)}
+                            className={`rounded-lg py-1.5 px-2 text-center text-[11px] font-mono transition cursor-pointer flex flex-col items-center justify-center gap-0.5 border ${
+                              isSelected
+                                ? "bg-rose-500/25 border-rose-500/60 text-white font-bold shadow-sm shadow-rose-900/50"
+                                : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+                            }`}
+                          >
+                            <span>{sev} std</span>
+                            <span className="text-[9px] text-slate-400">
+                              {(PENALIZATION_SEVERITY_VALUES[sev] * 100).toFixed(0)}% de &sigma;
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Criterio 4: match_semantico_area_programa */}
+              <div
+                className={`rounded-xl border p-4 transition space-y-3 ${
+                  penalizationConfig.match_semantico_area_programa.active
+                    ? "border-rose-500/40 bg-gradient-to-br from-rose-950/20 via-slate-900/60 to-slate-950 shadow-sm shadow-rose-950/30"
+                    : "border-white/5 bg-slate-900/30 hover:border-white/10"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-white">
+                        4. Match Semántico por Área/Programa
+                      </span>
+                      <span className="rounded bg-teal-500/15 border border-teal-500/30 px-1.5 py-0.5 text-[10px] font-mono text-teal-300 font-semibold">
+                        match_semantico_area_programa = True
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Penaliza asignaturas con afinidad semántica preexistente a nivel de área temática o programa académico.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleTogglePenalizationCriterion("match_semantico_area_programa")}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                      penalizationConfig.match_semantico_area_programa.active ? "bg-rose-600" : "bg-slate-700"
+                    }`}
+                    role="switch"
+                    aria-checked={penalizationConfig.match_semantico_area_programa.active}
+                    title={penalizationConfig.match_semantico_area_programa.active ? "Desactivar penalización" : "Activar penalización"}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                        penalizationConfig.match_semantico_area_programa.active ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Selector de Severidad */}
+                {penalizationConfig.match_semantico_area_programa.active && (
+                  <div className="pt-2 border-t border-rose-500/20 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-300 font-medium">Severidad de penalización:</span>
+                      <span className="text-rose-300 font-mono font-bold">
+                        {penalizationConfig.match_semantico_area_programa.severity} &sigma; ({(PENALIZATION_SEVERITY_VALUES[penalizationConfig.match_semantico_area_programa.severity] * 100).toFixed(0)}% std)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(["5/100", "10/100", "20/100"] as PenalizationSeverity[]).map((sev) => {
+                        const isSelected = penalizationConfig.match_semantico_area_programa.severity === sev;
+                        return (
+                          <button
+                            key={sev}
+                            type="button"
+                            onClick={() => handleSetPenalizationSeverity("match_semantico_area_programa", sev)}
+                            className={`rounded-lg py-1.5 px-2 text-center text-[11px] font-mono transition cursor-pointer flex flex-col items-center justify-center gap-0.5 border ${
+                              isSelected
+                                ? "bg-rose-500/25 border-rose-500/60 text-white font-bold shadow-sm shadow-rose-900/50"
+                                : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
+                            }`}
+                          >
+                            <span>{sev} std</span>
+                            <span className="text-[9px] text-slate-400">
+                              {(PENALIZATION_SEVERITY_VALUES[sev] * 100).toFixed(0)}% de &sigma;
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Banner Informativo de Optimización */}
+            <div className="rounded-lg bg-slate-900/60 border border-white/5 p-3 flex items-start gap-2.5 text-[11px] text-slate-400">
+              <Info className="h-4 w-4 text-indigo-400 flex-shrink-0 mt-0.5" />
+              <div className="space-y-0.5 leading-relaxed">
+                <span className="text-slate-200 font-semibold">Cálculo Optimizado y Seguro: </span>
+                <span>
+                  Cada penalización se calcula como <code className="bg-slate-950 px-1 py-0.2 rounded text-rose-300 font-mono text-[10px]">severidad &times; &sigma;</code> y se resta de la similitud compuesta (<code className="bg-slate-950 px-1 py-0.2 rounded text-emerald-300 font-mono text-[10px]">sim_penalizada = max(0, sim_base &minus; &sum;penalizaciones)</code>). El muestreo aleatorio de hasta 1,000 matches se realiza íntegramente en el backend mediante operaciones vectorizadas, garantizando cero sobrecarga de memoria en el navegador y consultas ultraligeras a Supabase.
+                </span>
+              </div>
+            </div>
+          </div>
+
           {/* Selector de Modo de Filtrado: Threshold O Número de Asignaturas O Ambos */}
           <div className="rounded-xl border border-white/10 bg-slate-950/80 p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -4250,9 +4713,18 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                <span className="rounded-lg bg-purple-500/15 border border-purple-500/30 px-2.5 py-1 text-[11px] font-medium text-purple-300 flex items-center gap-1">
-                  <span>🎯 match_nombre=True no consume cupo</span>
-                </span>
+                {penalizationConfig.match_nombre.active ? (
+                  <span
+                    className="rounded-lg bg-rose-500/15 border border-rose-500/30 px-2.5 py-1 text-[11px] font-medium text-rose-300 flex items-center gap-1"
+                    title="Al penalizar match_nombre, las asignaturas compiten con su similitud penalizada y consumen cupo normalmente"
+                  >
+                    <span>🎯 match_nombre penalizado (consume cupo)</span>
+                  </span>
+                ) : (
+                  <span className="rounded-lg bg-purple-500/15 border border-purple-500/30 px-2.5 py-1 text-[11px] font-medium text-purple-300 flex items-center gap-1">
+                    <span>🎯 match_nombre=True no consume cupo</span>
+                  </span>
+                )}
                 {isFilterEffective ? (
                   <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 text-[11px] font-mono text-emerald-300 flex items-center gap-1 font-semibold">
                     <span>⚡ Filtro activo: {filteredAsignaturas.length} asignaturas (de {totalCatalogCount})</span>
@@ -5637,10 +6109,52 @@ export default function TabMatching({ onOpenSqlModal }: TabMatchingProps) {
                                           <span>{matchItem.cluster}</span>
                                         </span>
                                       )}
+                                      {matchItem.penalizationApplied != null && matchItem.penalizationApplied > 0 && (
+                                        <span
+                                          className="rounded-md bg-rose-500/20 text-rose-300 border border-rose-500/40 px-2 py-0.5 text-[10px] font-semibold flex items-center gap-1 cursor-help"
+                                          title={`Penalización total: -${(matchItem.penalizationApplied * 100).toFixed(2)}%\nSimilitud original: ${((matchItem.rawCompositeSimilarity ?? matchItem.compositeSimilarity) * 100).toFixed(1)}%\nσ muestral: ${((matchItem.penalizationStd ?? 0) * 100).toFixed(2)}%\nDesglose:\n${matchItem.penalizationBreakdown ? Object.entries(matchItem.penalizationBreakdown).map(([k, v]) => `• ${k}: -${(v * 100).toFixed(2)}%`).join("\n") : ""}`}
+                                        >
+                                          <Scale className="h-3 w-3 text-rose-400" />
+                                          <span>-{(matchItem.penalizationApplied * 100).toFixed(1)}% Penalizado</span>
+                                          {matchItem.rawCompositeSimilarity != null && (
+                                            <span className="text-[9px] text-rose-200/70 font-normal line-through">
+                                              {(matchItem.rawCompositeSimilarity * 100).toFixed(1)}%
+                                            </span>
+                                          )}
+                                        </span>
+                                      )}
                                       {matchItem.match_nombre && (
                                         <span className="rounded-md bg-purple-500/20 text-purple-300 border border-purple-500/40 px-2 py-0.5 text-[10px] font-semibold flex items-center gap-1">
                                           <span>🎯 Match Nombre</span>
-                                          <span className="text-[9px] text-purple-200/80 font-normal">(Exento de cupo Top K)</span>
+                                          {matchItem.penalizationApplied && matchItem.penalizationBreakdown?.match_nombre ? (
+                                            <span className="text-[9px] text-purple-200/80 font-normal">(Penalizado)</span>
+                                          ) : (
+                                            <span className="text-[9px] text-purple-200/80 font-normal">(Exento de cupo Top K)</span>
+                                          )}
+                                        </span>
+                                      )}
+                                      {matchItem.match_semantico && (
+                                        <span
+                                          className="hidden lg:inline-flex items-center gap-1 rounded-md bg-sky-500/15 border border-sky-500/30 px-1.5 py-0.5 text-[10px] font-medium text-sky-200"
+                                          title="match_semantico = True en BD"
+                                        >
+                                          <span>Match Semántico</span>
+                                        </span>
+                                      )}
+                                      {matchItem.match_nombre_area_programa && (
+                                        <span
+                                          className="hidden lg:inline-flex items-center gap-1 rounded-md bg-indigo-500/15 border border-indigo-500/30 px-1.5 py-0.5 text-[10px] font-medium text-indigo-200"
+                                          title="match_nombre_area_programa = True en BD"
+                                        >
+                                          <span>Área Nombre</span>
+                                        </span>
+                                      )}
+                                      {matchItem.match_semantico_area_programa && (
+                                        <span
+                                          className="hidden lg:inline-flex items-center gap-1 rounded-md bg-teal-500/15 border border-teal-500/30 px-1.5 py-0.5 text-[10px] font-medium text-teal-200"
+                                          title="match_semantico_area_programa = True en BD"
+                                        >
+                                          <span>Área Semántico</span>
                                         </span>
                                       )}
                                       {matchItem.vectors && Object.keys(matchItem.vectors).length > 1 ? (

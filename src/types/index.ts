@@ -111,6 +111,35 @@ export interface ClusterVerificationResult {
 
 export type ProfessorImportMode = "generate" | "only_match";
 
+export type PenalizationSeverity = '5/100' | '10/100' | '20/100';
+
+export interface PenalizationCriterionConfig {
+  active: boolean;
+  severity: PenalizationSeverity;
+}
+
+export interface PenalizationConfig {
+  enabled: boolean;
+  match_nombre: PenalizationCriterionConfig;
+  match_semantico: PenalizationCriterionConfig;
+  match_nombre_area_programa: PenalizationCriterionConfig;
+  match_semantico_area_programa: PenalizationCriterionConfig;
+}
+
+export const PENALIZATION_SEVERITY_VALUES: Record<PenalizationSeverity, number> = {
+  '5/100': 0.05,
+  '10/100': 0.10,
+  '20/100': 0.20,
+};
+
+export const DEFAULT_PENALIZATION_CONFIG: PenalizationConfig = {
+  enabled: false,
+  match_nombre: { active: false, severity: '10/100' },
+  match_semantico: { active: false, severity: '10/100' },
+  match_nombre_area_programa: { active: false, severity: '10/100' },
+  match_semantico_area_programa: { active: false, severity: '10/100' },
+};
+
 export interface MatchResultItem {
   asignaturaId: number;
   clave: string;
@@ -120,9 +149,16 @@ export interface MatchResultItem {
   fines_de_aprendizaje_o_formacion?: string | null;
   actividades_de_aprendizaje?: string | null;
   compositeSimilarity: number;
+  rawCompositeSimilarity?: number;
+  penalizationApplied?: number;
+  penalizationBreakdown?: Record<string, number>;
+  penalizationStd?: number;
   fieldSimilarities: Record<string, number>;
   pairSimilarities?: Record<string, number>;
   match_nombre?: boolean;
+  match_semantico?: boolean;
+  match_nombre_area_programa?: boolean;
+  match_semantico_area_programa?: boolean;
   embedding_768?: number[] | null;
   vectors?: Record<string, number[]> | null;
   [key: string]: any;
